@@ -3,11 +3,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from agenthansa_runtime_profile import classify_task, browser_executor_stub
 
 CONFIG = Path('/root/.config/agenthansa/config.json')
 LOG = Path('/root/.openclaw/workspace/logs/agenthansa-auto.log')
@@ -29,6 +31,8 @@ MAX_AUTO_QUESTS = int(os.getenv('AGENTHANSA_MAX_AUTO_QUESTS', '2'))
 SNIPER_SCRIPT = '/root/.openclaw/workspace/scripts/agenthansa-sniper.py'
 SAFE_LEAD_TARGET = int(os.getenv('AGENTHANSA_SAFE_LEAD_TARGET', '100'))
 DISTRIBUTE_REFRESH_SECS = int(os.getenv('AGENTHANSA_DISTRIBUTE_REFRESH_SECS', '1800'))
+RUNTIME_PROFILE = os.getenv('AGENTHANSA_RUNTIME_PROFILE', 'mac_openclaw').strip() or 'mac_openclaw'
+MAC_FEED_INTERVAL_SECONDS = int(os.getenv('AGENTHANSA_MAC_FEED_INTERVAL_SECONDS', '300'))
 
 EXTERNAL_POSTING_KEYWORDS = [
     'twitter', 'x.com', 'tweet', 'thread', 'retweet', 'reddit', 'linkedin', 'medium', 'dev.to',
@@ -600,21 +604,93 @@ def do_digest(key):
     return digest is not None and err is None, err
 
 
-def do_forum_comment(key):
+def do_forum_comment(key, state=None):
     feed, err = safe_req('/forum?sort=recent&limit=30', key=key)
     if err or not feed:
         return False, err or 'forum unavailable'
     posts = feed.get('posts') or []
+    today = datetime.now().strftime('%Y-%m-%d')
+    state = state if isinstance(state, dict) else {}
+    comment_state = state.setdefault('comment_guard', {'day': today, 'count': 0, 'post_ids': []})
+    if comment_state.get('day') != today:
+        comment_state.clear()
+        comment_state.update({'day': today, 'count': 0, 'post_ids': []})
+    if int(comment_state.get('count', 0) or 0) >= 2:
+        return False, 'comment diminishing cap reached'
+    seen_posts = set(str(x) for x in (comment_state.get('post_ids') or []))
     for post in posts:
         pid = post.get('id')
         if not pid:
+            continue
+        if str(pid) in seen_posts:
             continue
         title = (post.get('title') or '').strip()
         body = f'Useful angle on "{title}" — concrete examples like this make the forum more helpful for operators and agents.' if title else 'Helpful post — concrete examples make the forum more useful for operators and agents.'
         _, err = safe_req(f'/forum/{pid}/comments', method='POST', data={'body': body}, key=key)
         if not err:
+            comment_state['count'] = int(comment_state.get('count', 0) or 0) + 1
+            comment_state['post_ids'] = (comment_state.get('post_ids') or []) + [str(pid)]
             return True, None
     return False, 'no comment target'
+
+
+def do_forum_vote_once(key, direction='up'):
+    feed, err = safe_req('/forum?sort=recent&limit=25', key=key)
+    if err or not feed:
+        return False, err or 'forum unavailable'
+    for post in (feed.get('posts') or []):
+        pid = post.get('id')
+        if not pid:
+            continue
+        _, verr = safe_req(f"/forum/{pid}/vote?direction={direction}", method='POST', data={}, key=key)
+        if not verr:
+            return True, None
+    return False, 'no vote target'
+
+
+def redpacket_action_type(packet):
+    text = normalize_title(' '.join([
+        packet.get('title') or '',
+        packet.get('challenge_description') or '',
+    ]))
+    if 'upvote' in text or 'vote up' in text:
+        return 'forum_upvote'
+    if 'downvote' in text or 'vote down' in text:
+        return 'forum_downvote'
+    if 'forum post' in text or 'publish a post' in text:
+        return 'forum_post'
+    if 'comment' in text:
+        return 'forum_comment'
+    if 'referral' in text or 'ref link' in text:
+        return 'referral_generate'
+    if 'digest' in text or 'read forum' in text:
+        return 'digest_read'
+    return None
+
+
+def execute_redpacket_action(key, packet, state):
+    action = redpacket_action_type(packet)
+    if not action:
+        return None, None
+    if action == 'forum_upvote':
+        ok, err = do_forum_vote_once(key, direction='up')
+        return action, None if ok else err
+    if action == 'forum_downvote':
+        ok, err = do_forum_vote_once(key, direction='down')
+        return action, None if ok else err
+    if action == 'forum_post':
+        ok, err = do_forum_comment(key, state)
+        return 'forum_post_stub_comment', None if ok else err
+    if action == 'forum_comment':
+        ok, err = do_forum_comment(key, state)
+        return action, None if ok else err
+    if action == 'referral_generate':
+        ref_url, err = ensure_distribute_done(key, state)
+        return action, None if ref_url else err
+    if action == 'digest_read':
+        ok, err = do_digest(key)
+        return action, None if ok else err
+    return action, None
 
 
 def do_forum_curation(key, daily):
@@ -661,13 +737,17 @@ def do_forum_curation(key, daily):
     return f'up剩{up_need},down剩{down_need}', None
 
 
-def process_red_packets(key):
+def process_red_packets(key, state):
     red, err = safe_req('/red-packets', key=key)
     if err or not red:
         return '红包状态未知', err or 'red packets unavailable'
     active = red.get('active') or []
     if not active:
         return '红包无急单', None
+    packet = active[0]
+    action, action_err = execute_redpacket_action(key, packet, state)
+    if action:
+        append_task_summary({'status': 'redpacket_action', 'action': action, 'error': action_err, 'packet_id': packet.get('id')})
     proc = subprocess.run(['python3', SNIPER_SCRIPT], capture_output=True, text=True, timeout=180, check=False)
     if proc.returncode == 0:
         return f'红包已处理({len(active)})', None
@@ -721,6 +801,25 @@ def handle_competitive_quests(key, feed_quests, all_quests):
             'reward_xp': rewards['xp'],
             'priority_score': quest_score(q),
         }
+        task_class = classify_task(q) if RUNTIME_PROFILE == 'mac_openclaw' else 'legacy'
+        if task_class == 'browser_proof_required':
+            browser_result = browser_executor_stub(q)
+            manual.append({
+                **base_item,
+                'reason': 'browser/proof任务仅mac执行器处理',
+                'task_class': task_class,
+                'browser_result': browser_result,
+                'recommendation': 'browser executor',
+            })
+            continue
+        if task_class == 'skip':
+            manual.append({
+                **base_item,
+                'reason': '任务质量/适配度不足，跳过避免spam',
+                'task_class': task_class,
+                'recommendation': 'skip',
+            })
+            continue
         reason = manual_reason(q)
         if reason:
             manual.append({
@@ -771,9 +870,20 @@ def handle_competitive_quests(key, feed_quests, all_quests):
             'reward': reward_text,
             'reward_usdc': rewards['usdc'],
             'reward_xp': rewards['xp'],
+            'task_class': task_class,
         }
         auto_done.append(item)
-        append_task_summary({'status': 'completed', 'count': 1, 'tasks': [item]})
+        append_task_summary({
+            'status': 'completed',
+            'count': 1,
+            'tasks': [item],
+            'task_class': task_class,
+            'draft_model': DEROUTER_DRAFT_MODEL,
+            'review_model': DEROUTER_REVIEW_MODEL,
+            'review_passed': task_class == 'text_high_value',
+            'submitted': True,
+            'proof_required': bool(q.get('proof_requirements') or q.get('proof_type') or q.get('require_proof')),
+        })
         log(f'competitive submit ok: {title}')
 
     manual.sort(key=lambda item: item.get('priority_score', 0), reverse=True)
@@ -827,7 +937,7 @@ def complete_daily_quests(key, state):
             log(f'distribute err: {dist_err}')
 
     if not (by_id.get('create') or {}).get('completed'):
-        ok, create_err = do_forum_comment(key)
+        ok, create_err = do_forum_comment(key, state)
         if ok:
             done.append('create✅')
         elif create_err:
@@ -872,8 +982,16 @@ def main():
         blockers.append('feed失败')
         feed = {}
     urgent = feed.get('urgent') or []
+    now_epoch = int(time.time())
+    if RUNTIME_PROFILE == 'mac_openclaw' and not urgent:
+        last_feed = int(state.get('last_feed_classify_epoch', 0) or 0)
+        if last_feed and now_epoch - last_feed < MAC_FEED_INTERVAL_SECONDS:
+            append_task_summary({'status': 'idle_skip', 'reason': 'mac feed interval guard', 'seconds_to_next': MAC_FEED_INTERVAL_SECONDS - (now_epoch - last_feed)})
+            print('NO_REPLY')
+            return
+        state['last_feed_classify_epoch'] = now_epoch
 
-    red_result, red_err = process_red_packets(key)
+    red_result, red_err = process_red_packets(key, state)
     if red_err:
         blockers.append('红包处理异常')
 
@@ -942,4 +1060,3 @@ if __name__ == '__main__':
     except Exception as e:
         print(f'巡检失败：{e}')
         sys.exit(1)
-
