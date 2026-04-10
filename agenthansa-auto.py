@@ -9,13 +9,16 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from agenthansa_runtime_profile import classify_task, browser_executor_stub
+from agenthansa_runtime_profile import classify_task, classify_task_detail, browser_executor_stub
 
-CONFIG = Path('/root/.config/agenthansa/config.json')
-LOG = Path('/root/.openclaw/workspace/logs/agenthansa-auto.log')
-STATE = Path('/root/.openclaw/workspace/memory/agenthansa-state.json')
-TASK_SUMMARY = Path('/root/.openclaw/workspace/memory/agenthansa-task-summary.jsonl')
-MANUAL_QUEUE = Path('/root/.openclaw/workspace/memory/agenthansa-manual-quests.json')
+HOME = Path.home()
+WORKSPACE = Path(os.getenv('AGENTHANSA_WORKSPACE', str(HOME / '.openclaw' / 'workspace')))
+CONFIG = Path(os.getenv('AGENTHANSA_CONFIG', str(HOME / '.config' / 'agenthansa' / 'config.json')))
+LOG = Path(os.getenv('AGENTHANSA_LOG', str(WORKSPACE / 'logs' / 'agenthansa-auto.log')))
+STATE = Path(os.getenv('AGENTHANSA_STATE', str(WORKSPACE / 'memory' / 'agenthansa-state.json')))
+TASK_SUMMARY = Path(os.getenv('AGENTHANSA_TASK_SUMMARY', str(WORKSPACE / 'memory' / 'agenthansa-task-summary.jsonl')))
+UNKNOWN_CHALLENGE_LOG = Path(os.getenv('AGENTHANSA_UNKNOWN_CHALLENGE_LOG', str(WORKSPACE / 'memory' / 'agenthansa-unknown-challenges.jsonl')))
+MANUAL_QUEUE = Path(os.getenv('AGENTHANSA_MANUAL_QUEUE', str(WORKSPACE / 'memory' / 'agenthansa-manual-quests.json')))
 BASE = 'https://www.agenthansa.com/api'
 UA = 'OpenClaw-Xiami/1.0'
 EDGEFN_URL = 'https://api.edgefn.net/v1/chat/completions'
@@ -26,10 +29,12 @@ DEROUTER_KEY = os.getenv('DEROUTER_API_KEY', '')
 DEROUTER_DRAFT_MODEL = os.getenv('AGENTHANSA_DRAFT_MODEL', 'claude-sonnet-4-5')
 DEROUTER_REVIEW_MODEL = os.getenv('AGENTHANSA_REVIEW_MODEL', 'gpt-5.4')
 HIGH_VALUE_MODE = os.getenv('AGENTHANSA_HIGH_VALUE_MODE', 'B').upper().strip() or 'B'
+HIGH_VALUE_ROUTE = os.getenv('AGENTHANSA_HIGH_VALUE_ROUTE', 'sonnet_draft_gpt_final').strip()
 HIGH_VALUE_REVIEW_USDC = float(os.getenv('AGENTHANSA_HIGH_VALUE_REVIEW_USDC', '20'))
 AUTO_SUBMIT_COMPETITIVE = os.getenv('AGENTHANSA_AUTO_SUBMIT_COMPETITIVE', '1').lower() in {'1', 'true', 'yes', 'on'}
 MAX_AUTO_QUESTS = int(os.getenv('AGENTHANSA_MAX_AUTO_QUESTS', '2'))
-SNIPER_SCRIPT = '/root/.openclaw/workspace/scripts/agenthansa-sniper.py'
+SNIPER_SCRIPT = os.getenv('AGENTHANSA_SNIPER_SCRIPT', str(WORKSPACE / 'scripts' / 'agenthansa-sniper.py'))
+BROWSER_EXECUTOR_CMD = os.getenv('AGENTHANSA_BROWSER_EXECUTOR_CMD', '')
 SAFE_LEAD_TARGET = int(os.getenv('AGENTHANSA_SAFE_LEAD_TARGET', '100'))
 DISTRIBUTE_REFRESH_SECS = int(os.getenv('AGENTHANSA_DISTRIBUTE_REFRESH_SECS', '1800'))
 RUNTIME_PROFILE = os.getenv('AGENTHANSA_RUNTIME_PROFILE', 'mac_openclaw').strip() or 'mac_openclaw'
@@ -100,6 +105,12 @@ def log(msg):
 def append_task_summary(event: dict):
     TASK_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     with TASK_SUMMARY.open('a', encoding='utf-8') as f:
+        f.write(json.dumps({'ts': datetime.now().isoformat(timespec='seconds'), **event}, ensure_ascii=False) + '\n')
+
+
+def append_unknown_challenge(event: dict):
+    UNKNOWN_CHALLENGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with UNKNOWN_CHALLENGE_LOG.open('a', encoding='utf-8') as f:
         f.write(json.dumps({'ts': datetime.now().isoformat(timespec='seconds'), **event}, ensure_ascii=False) + '\n')
 
 
@@ -327,8 +338,9 @@ def get_derouter_settings():
         cfg = {}
     return {
         'key': DEROUTER_KEY or cfg.get('derouter_api_key') or '',
-        'draft_model': cfg.get('derouter_gpt_model') or DEROUTER_DRAFT_MODEL,
+        'draft_model': cfg.get('derouter_draft_model') or DEROUTER_DRAFT_MODEL,
         'review_model': cfg.get('derouter_review_model') or DEROUTER_REVIEW_MODEL,
+        'route': cfg.get('high_value_route') or HIGH_VALUE_ROUTE,
     }
 
 
@@ -649,6 +661,31 @@ def do_forum_vote_once(key, direction='up'):
     return False, 'no vote target'
 
 
+def run_browser_executor(task):
+    stub = browser_executor_stub(task)
+    if not BROWSER_EXECUTOR_CMD:
+        return {**stub, 'ok': False, 'error': 'browser_executor_cmd_missing'}
+    try:
+        proc = subprocess.run(
+            [BROWSER_EXECUTOR_CMD, json.dumps(task, ensure_ascii=False)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode == 0:
+            try:
+                payload = json.loads((proc.stdout or '').strip() or '{}')
+            except Exception:
+                payload = {'ok': True, 'proof_url': (proc.stdout or '').strip()}
+            payload.setdefault('ok', True)
+            payload.setdefault('contract', stub.get('contract'))
+            return payload
+        return {**stub, 'ok': False, 'error': (proc.stderr or proc.stdout or 'executor_failed')[:300]}
+    except Exception as e:
+        return {**stub, 'ok': False, 'error': str(e)}
+
+
 def redpacket_action_type(packet):
     text = normalize_title(' '.join([
         packet.get('title') or '',
@@ -672,6 +709,13 @@ def redpacket_action_type(packet):
 def execute_redpacket_action(key, packet, state):
     action = redpacket_action_type(packet)
     if not action:
+        append_unknown_challenge({
+            'packet_id': packet.get('id'),
+            'title': packet.get('title'),
+            'challenge_description': packet.get('challenge_description'),
+            'context': {'task_type': packet.get('type'), 'status': packet.get('status')},
+            'classification': 'unknown',
+        })
         return None, None
     if action == 'forum_upvote':
         ok, err = do_forum_vote_once(key, direction='up')
@@ -802,13 +846,22 @@ def handle_competitive_quests(key, feed_quests, all_quests):
             'reward_xp': rewards['xp'],
             'priority_score': quest_score(q),
         }
-        task_class = classify_task(q) if RUNTIME_PROFILE == 'mac_openclaw' else 'legacy'
+        task_meta = classify_task_detail(q) if RUNTIME_PROFILE == 'mac_openclaw' else {'task_class': 'legacy', 'reason': 'non-mac legacy mode'}
+        task_class = task_meta['task_class']
         if task_class == 'browser_proof_required':
-            browser_result = browser_executor_stub(q)
+            browser_result = run_browser_executor(q) if RUNTIME_PROFILE == 'mac_openclaw' else browser_executor_stub(q)
+            append_task_summary({
+                'status': 'browser_executor_routed',
+                'task_class': task_class,
+                'title': title,
+                'task_reason': task_meta.get('reason'),
+                'browser_result': browser_result,
+            })
             manual.append({
                 **base_item,
-                'reason': 'browser/proof任务仅mac执行器处理',
+                'reason': 'browser/proof任务已路由browser executor',
                 'task_class': task_class,
+                'task_reason': task_meta.get('reason'),
                 'browser_result': browser_result,
                 'recommendation': 'browser executor',
             })
@@ -816,7 +869,7 @@ def handle_competitive_quests(key, feed_quests, all_quests):
         if task_class == 'skip':
             manual.append({
                 **base_item,
-                'reason': '任务质量/适配度不足，跳过避免spam',
+                'reason': f"任务已skip：{task_meta.get('reason')}",
                 'task_class': task_class,
                 'recommendation': 'skip',
             })
@@ -872,6 +925,7 @@ def handle_competitive_quests(key, feed_quests, all_quests):
             'reward_usdc': rewards['usdc'],
             'reward_xp': rewards['xp'],
             'task_class': task_class,
+            'task_reason': task_meta.get('reason'),
         }
         auto_done.append(item)
         append_task_summary({

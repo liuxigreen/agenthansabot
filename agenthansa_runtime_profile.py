@@ -33,24 +33,28 @@ def _text(task_like):
     return ' '.join(values).lower()
 
 
-def classify_task(task_like):
+def classify_task_detail(task_like):
     text = _text(task_like)
     kind = str((task_like or {}).get('type') or (task_like or {}).get('kind') or '').lower() if isinstance(task_like, dict) else ''
-    if 'red packet' in text or 'red-packet' in text or kind == 'redpacket':
-        return 'redpacket'
+    if any(x in text for x in ['challenge_description', 'join', 'next_packet', 'red packet', 'red-packet']) or kind == 'redpacket':
+        return {'task_class': 'redpacket', 'reason': 'packet/join semantics detected'}
     if any(x in text for x in ['daily quest', 'checkin', 'digest', 'distribute', 'curate', 'read forum']):
-        return 'daily_api'
+        return {'task_class': 'daily_api', 'reason': 'daily quest family matched'}
     if any(x in text for x in BROWSER_PROOF_KEYWORDS):
-        return 'browser_proof_required'
+        return {'task_class': 'browser_proof_required', 'reason': 'proof/browser/external/manual requirement detected'}
     if any(x in text for x in SPAMMY_KEYWORDS):
-        return 'skip'
+        return {'task_class': 'skip', 'reason': 'spam-prone pattern'}
     if any(x in text for x in HIGH_VALUE_KEYWORDS):
-        return 'text_high_value'
+        return {'task_class': 'text_high_value', 'reason': 'high-value keyword match'}
     if any(x in text for x in SIMPLE_TEXT_KEYWORDS) or re.search(r'\b(write|draft|answer|explain)\b', text):
-        return 'text_simple'
+        return {'task_class': 'text_simple', 'reason': 'text-only simple task pattern'}
     if text.strip():
-        return 'skip'
-    return 'skip'
+        return {'task_class': 'skip', 'reason': 'ambiguous/low-fit automation target'}
+    return {'task_class': 'skip', 'reason': 'empty task context'}
+
+
+def classify_task(task_like):
+    return classify_task_detail(task_like)['task_class']
 
 
 def browser_executor_stub(task):
