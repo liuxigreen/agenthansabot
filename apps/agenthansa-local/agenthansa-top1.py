@@ -37,6 +37,9 @@ WATCH_MAX_SECONDS = int(os.getenv('AGENTHANSA_WATCH_MAX_SECONDS', '360'))
 TASK_PUSH_EVERY_SECONDS = int(os.getenv('AGENTHANSA_TASK_PUSH_EVERY_SECONDS', '3600'))
 SUMMARY_EVERY_SECONDS = int(os.getenv('AGENTHANSA_SUMMARY_EVERY_SECONDS', '10800'))
 MAX_JOIN_ATTEMPTS_PER_PACKET = int(os.getenv('AGENTHANSA_MAX_JOIN_ATTEMPTS', '3'))
+REDPACKET_WINDOW_SECONDS = int(os.getenv('AGENTHANSA_REDPACKET_WINDOW_SECONDS', '240'))
+REDPACKET_RETRY_MIN_SECONDS = int(os.getenv('AGENTHANSA_REDPACKET_RETRY_MIN_SECONDS', '10'))
+REDPACKET_RETRY_MAX_SECONDS = int(os.getenv('AGENTHANSA_REDPACKET_RETRY_MAX_SECONDS', '20'))
 AUTO_SUBMIT_DEDUP_SECONDS = int(os.getenv('AGENTHANSA_AUTO_SUBMIT_DEDUP_SECONDS', '43200'))
 AUTO_POST = os.getenv('AGENTHANSA_AUTO_POST', '1').lower() in {'1','true','yes','on'}
 AUTO_SUBMIT_ALLIANCE = os.getenv('AGENTHANSA_AUTO_SUBMIT_ALLIANCE', '1').lower() in {'1','true','yes','on'}
@@ -877,6 +880,30 @@ def review_with_claude(prompt, draft, max_tokens=320):
         raise
 
 
+def review_with_backup_models(prompt, draft, max_tokens=320):
+    review_prompt = (
+        'Rewrite this AgentHansa submission draft into a stronger final version. '
+        'Keep concrete points, remove fluff, keep it submit-ready and natural. '
+        'Output only final text, no markdown.\n\n'
+        f'Task:\n{prompt}\n\nDraft:\n{draft}'
+    )
+    try:
+        text = small_llm_generate(review_prompt)
+        text = clean_model_output(text)
+        if text and len(text.split()) >= 32:
+            return text
+    except Exception as e:
+        log(f'backup review small model err: {e}')
+    try:
+        text = deepseek_generate(review_prompt, max_tokens=max_tokens, temperature=0.35)
+        text = clean_model_output(text)
+        if text and len(text.split()) >= 32:
+            return text
+    except Exception as e:
+        log(f'backup review deepseek err: {e}')
+    return None
+
+
 def build_forum_post_content():
     angle = pick_forum_angle('agenthansa', 'forum strategy')
     prompt = (
@@ -1014,7 +1041,10 @@ def build_submission_content(q):
                 if reviewed and len(reviewed.split()) >= 40:
                     return reviewed
             except Exception as e:
-                log(f'high_value review err, keep draft: {e}')
+                log(f'high_value review err, try backup review: {e}')
+                backup_reviewed = review_with_backup_models(prompt, draft, max_tokens=320)
+                if backup_reviewed:
+                    return backup_reviewed
             return draft
         if router_is_available():
             try:
@@ -1589,12 +1619,12 @@ def perform_challenge(key, packet, state, my_name):
     return 'unknown'
 
 
-def get_active_packet(key):
+def get_active_packets(key):
     data, err = safe_req('/red-packets', key=key)
     if err or not data:
-        return None, data, err
+        return [], data, err
     active = data.get('active') or []
-    return (active[0] if active else None), data, None
+    return active, data, None
 
 
 def join_packet(key, packet_id, max_attempts=2):
@@ -1632,34 +1662,48 @@ def join_packet(key, packet_id, max_attempts=2):
 
 
 def process_red_packets(key, state, my_name):
-    packet, data, err = get_active_packet(key)
+    packets, data, err = get_active_packets(key)
     if err:
         return '红包状态未知', err
-    if not packet:
+    if not packets:
         return '红包无急单', None
-    packet_id = str(packet.get('id'))
     attempted = state.setdefault('attempted_packets', {})
     join_attempts = state.setdefault('join_attempts', {})
-    if attempted.get(packet_id):
-        return '红包已处理过', None
-    if join_attempts.get(packet_id, 0) >= MAX_JOIN_ATTEMPTS_PER_PACKET:
-        return '红包重试已达上限', None
-    try:
-        action_result = perform_challenge(key, packet, state, my_name)
-        question, answer, joined, solver, attempt = join_packet(key, packet_id)
-        attempted[packet_id] = int(time.time())
-        join_attempts.pop(packet_id, None)
-        amount = None
-        if isinstance(joined, dict):
-            amount = joined.get('estimated_per_person') or joined.get('amount') or joined.get('reward')
-        append_summary({'status': 'redpacket_success', 'packet_title': packet.get('title'), 'question': question, 'answer': answer, 'solver': solver, 'attempt': attempt, 'action_result': action_result, 'estimated_per_person': amount})
-        notify(f'🧧✅ Red Packet：{amount or "?"}')
-        return f"红包成功 {packet.get('title')}", None
-    except Exception as e:
-        join_attempts[packet_id] = join_attempts.get(packet_id, 0) + 1
-        append_summary({'status': 'redpacket_failure', 'packet_title': packet.get('title'), 'error': str(e)[:300]})
-        notify(f'红包失败｜{packet.get("title")}｜{str(e)[:500]}')
-        return '红包处理失败', str(e)
+    retry_after = state.setdefault('packet_retry_after', {})
+    now = int(time.time())
+    waiting = []
+    for packet in packets:
+        packet_id = str(packet.get('id'))
+        if attempted.get(packet_id):
+            continue
+        if join_attempts.get(packet_id, 0) >= MAX_JOIN_ATTEMPTS_PER_PACKET:
+            waiting.append(f'{packet_id}:retry_limit')
+            continue
+        if int(retry_after.get(packet_id, 0) or 0) > now:
+            waiting.append(f'{packet_id}:cooldown')
+            continue
+        try:
+            action_result = perform_challenge(key, packet, state, my_name)
+            question, answer, joined, solver, attempt = join_packet(key, packet_id)
+            attempted[packet_id] = int(time.time())
+            join_attempts.pop(packet_id, None)
+            retry_after.pop(packet_id, None)
+            amount = None
+            if isinstance(joined, dict):
+                amount = joined.get('estimated_per_person') or joined.get('amount') or joined.get('reward')
+            append_summary({'status': 'redpacket_success', 'packet_title': packet.get('title'), 'question': question, 'answer': answer, 'solver': solver, 'attempt': attempt, 'action_result': action_result, 'estimated_per_person': amount})
+            notify(f'🧧✅ Red Packet：{amount or "?"}')
+            return f"红包成功 {packet.get('title')}", None
+        except Exception as e:
+            join_attempts[packet_id] = join_attempts.get(packet_id, 0) + 1
+            delay = random.randint(max(5, REDPACKET_RETRY_MIN_SECONDS), max(REDPACKET_RETRY_MIN_SECONDS, REDPACKET_RETRY_MAX_SECONDS))
+            retry_after[packet_id] = int(time.time()) + delay
+            append_summary({'status': 'redpacket_failure', 'packet_title': packet.get('title'), 'error': str(e)[:300], 'next_retry_in_seconds': delay})
+            notify(f'红包失败｜{packet.get("title")}｜{str(e)[:500]}｜{delay}s后重试')
+            waiting.append(f'{packet_id}:error')
+    if waiting:
+        return f'红包等待重试({",".join(waiting[:3])})', None
+    return '红包已处理过', None
 
 
 def next_watch_sleep_seconds(key):
@@ -1669,7 +1713,7 @@ def next_watch_sleep_seconds(key):
     nxt = data.get('next_packet_seconds')
     active = data.get('active') or []
     if active:
-        return 10
+        return random.randint(max(5, REDPACKET_RETRY_MIN_SECONDS), max(REDPACKET_RETRY_MIN_SECONDS, REDPACKET_RETRY_MAX_SECONDS))
     if isinstance(nxt, (int, float)):
         if nxt <= PRE_WATCH_SECONDS:
             return 5
@@ -1684,15 +1728,20 @@ def maybe_watch_redpacket(key, state, my_name):
     active = data.get('active') or []
     nxt = data.get('next_packet_seconds')
     if active:
+        append_summary({
+            'status': 'redpacket_active_snapshot',
+            'count': len(active),
+            'packets': [{'id': p.get('id'), 'title': p.get('title'), 'challenge': p.get('challenge_description')} for p in active[:10]],
+        })
         return process_red_packets(key, state, my_name)
     if not isinstance(nxt, (int, float)) or nxt > PRE_WATCH_SECONDS:
         return None
-    deadline = time.time() + min(WATCH_MAX_SECONDS, max(30, int(nxt) + 120))
+    deadline = time.time() + min(WATCH_MAX_SECONDS, max(60, REDPACKET_WINDOW_SECONDS))
     while time.time() < deadline:
         result = process_red_packets(key, state, my_name)
         if result and result[0] != '红包无急单':
             return result
-        time.sleep(0.8 + random.uniform(0.05, 0.25))
+        time.sleep(random.uniform(max(5, REDPACKET_RETRY_MIN_SECONDS), max(REDPACKET_RETRY_MIN_SECONDS, REDPACKET_RETRY_MAX_SECONDS)))
     return None
 
 
