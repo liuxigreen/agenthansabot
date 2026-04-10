@@ -58,6 +58,7 @@ AINFT_TEST_MODEL = os.getenv('AINFT_TEST_MODEL', 'gpt-5.2')
 ROUTER_BASE_URL = os.getenv('AGENTHANSA_ROUTER_BASE_URL', '')
 ROUTER_API_KEY = os.getenv('AGENTHANSA_ROUTER_API_KEY', '')
 ROUTER_MODEL = os.getenv('AGENTHANSA_ROUTER_MODEL', 'claude-sonnet-4-5-20250929')
+ROUTER_DISABLE_SECONDS = int(os.getenv('AGENTHANSA_ROUTER_DISABLE_SECONDS', '21600'))
 DEEPSEEK_BASE_URL = os.getenv('AGENTHANSA_DEEPSEEK_BASE_URL', 'https://api.edgefn.net/v1')
 DEEPSEEK_API_KEY = os.getenv('AGENTHANSA_DEEPSEEK_API_KEY', os.getenv('EDGEFN_API_KEY', ''))
 DEEPSEEK_MODEL = os.getenv('AGENTHANSA_DEEPSEEK_MODEL', 'DeepSeek-V3.2')
@@ -98,6 +99,7 @@ NUMBER_WORDS = {
     'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
     'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90,
 }
+ROUTER_DISABLED_UNTIL = 0
 
 
 def now_str():
@@ -138,6 +140,21 @@ def append_summary(event):
     SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     with SUMMARY.open('a', encoding='utf-8') as f:
         f.write(json.dumps({'ts': datetime.now().isoformat(timespec='seconds'), **event}, ensure_ascii=False) + '\n')
+
+
+def is_auth_error(err):
+    text = str(err or '').lower()
+    return '401' in text or '403' in text or 'unauthorized' in text or 'forbidden' in text or 'invalid api key' in text
+
+
+def router_is_available():
+    return bool(ROUTER_API_KEY and ROUTER_BASE_URL and time.time() >= ROUTER_DISABLED_UNTIL)
+
+
+def router_disable(reason):
+    global ROUTER_DISABLED_UNTIL
+    ROUTER_DISABLED_UNTIL = int(time.time()) + ROUTER_DISABLE_SECONDS
+    log(f'router disabled until {ROUTER_DISABLED_UNTIL}: {reason}')
 
 
 def run_agenthansa_cli_json(args, timeout=180):
@@ -635,7 +652,7 @@ def classify_task_plan(task_like, default_model='deepseek'):
         fallback.update({'preferred_model': 'sonnet', 'style': 'variant', 'needs_variation': True})
     elif any(k in text for k in ['analysis', 'research', 'comparison', 'compare', 'pricing', 'faq', 'guide', 'list', 'find ', 'checklist']):
         fallback.update({'preferred_model': 'deepseek', 'style': 'research'})
-    if not ROUTER_API_KEY or not ROUTER_BASE_URL:
+    if not router_is_available():
         return fallback
     prompt = (
         'Classify this AgentHansa task for model routing. Output JSON only with keys '
@@ -655,6 +672,8 @@ def classify_task_plan(task_like, default_model='deepseek'):
                 'reason': str(data.get('reason') or 'router')[:60],
             }
     except Exception as e:
+        if is_auth_error(e):
+            router_disable(f'classify_task_plan auth error: {e}')
         log(f'classify_task_plan fallback: {e}')
     return fallback
 
@@ -717,12 +736,20 @@ def build_forum_comment_content(post):
         routes = [plan.get('preferred_model'), 'sonnet', 'deepseek', 'write']
         for route in routes:
             text = None
-            if route == 'sonnet':
-                text = router_generate(prompt, max_tokens=160, temperature=0.45)
-            elif route == 'deepseek':
-                text = deepseek_generate(prompt, max_tokens=160, temperature=0.45)
-            elif route == 'write':
-                text = llm_generate(prompt, model=WRITE_MODEL)
+            try:
+                if route == 'sonnet':
+                    if not router_is_available():
+                        continue
+                    text = router_generate(prompt, max_tokens=160, temperature=0.45)
+                elif route == 'deepseek':
+                    text = deepseek_generate(prompt, max_tokens=160, temperature=0.45)
+                elif route == 'write':
+                    text = llm_generate(prompt, model=WRITE_MODEL)
+            except Exception as route_err:
+                if route == 'sonnet' and is_auth_error(route_err):
+                    router_disable(f'forum comment auth error: {route_err}')
+                log(f'build_forum_comment_content route={route} err: {route_err}')
+                continue
             if text and len(text.split()) >= 8 and not is_generic_comment(text):
                 return text.strip()
     except Exception as e:
@@ -788,12 +815,14 @@ def build_submission_content(q):
                 return draft
         except Exception as e:
             log(f'high_value draft/review fallback: {e}')
-    if plan.get('preferred_model') == 'sonnet':
+    if plan.get('preferred_model') == 'sonnet' and router_is_available():
         try:
             text = router_generate(prompt, max_tokens=320, temperature=0.35)
             if text and len(text.split()) >= 30:
                 return text
         except Exception as e:
+            if is_auth_error(e):
+                router_disable(f'sonnet task auth error: {e}')
             log(f'sonnet task fallback: {e}')
     if simple_value or plan.get('preferred_model') == 'deepseek':
         try:
@@ -1060,8 +1089,20 @@ def handle_competitive_quests(key, feed_quests, all_quests, state, max_auto=MAX_
 
 
 def fetch_community_tasks():
-    data = run_agenthansa_cli_json(['tasks'])
-    return (data or {}).get('bounties') or (data or {}).get('tasks') or []
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            data = run_agenthansa_cli_json(['tasks'])
+            return (data or {}).get('bounties') or (data or {}).get('tasks') or []
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                time.sleep(2 * attempt)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return []
 
 
 def community_task_reason(task):
