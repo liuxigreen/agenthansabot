@@ -68,6 +68,7 @@ DEEPSEEK_MODEL = os.getenv('AGENTHANSA_DEEPSEEK_MODEL', 'DeepSeek-V3.2')
 DEEPSEEK_KEYCHAIN_SERVICE = os.getenv('AGENTHANSA_DEEPSEEK_KEYCHAIN_SERVICE', 'edgefn-chat-api-key')
 OPENAI_RETRY_TIMES = int(os.getenv('AGENTHANSA_OPENAI_RETRY_TIMES', '2'))
 OPENAI_RETRY_BASE_SECONDS = float(os.getenv('AGENTHANSA_OPENAI_RETRY_BASE_SECONDS', '1.2'))
+ANTI_SPAM_MEMORY_SIZE = int(os.getenv('AGENTHANSA_ANTI_SPAM_MEMORY_SIZE', '24'))
 OPENCLAW_BIN = os.getenv('OPENCLAW_BIN', '/Users/liuxi/.npm-global/bin/openclaw')
 AGENTHANSA_NPM_CACHE = os.getenv('AGENTHANSA_NPM_CACHE', str(WORKSPACE / 'tmp' / 'npm-cache'))
 
@@ -107,6 +108,8 @@ NUMBER_WORDS = {
 ROUTER_DISABLED_UNTIL = 0
 ROUTER_LAST_LOG = {}
 RECENT_COMMENT_OPENERS = []
+RECENT_COMMENT_FINGERPRINTS = []
+RECENT_POST_ANGLES = []
 
 
 def now_str():
@@ -774,6 +777,51 @@ def remember_comment_opener(text):
         del RECENT_COMMENT_OPENERS[:-12]
 
 
+def text_fingerprint(text, max_tokens=18):
+    low = normalize_title(text)
+    tokens = [t for t in re.findall(r'[a-z0-9]+', low) if len(t) > 2]
+    return ' '.join(tokens[:max_tokens])
+
+
+def is_repetitive_comment(text):
+    fp = text_fingerprint(text)
+    if not fp:
+        return True
+    if fp in RECENT_COMMENT_FINGERPRINTS:
+        return True
+    for old in RECENT_COMMENT_FINGERPRINTS[-8:]:
+        if fp[:60] and (fp.startswith(old[:60]) or old.startswith(fp[:60])):
+            return True
+    return False
+
+
+def remember_comment_fingerprint(text):
+    fp = text_fingerprint(text)
+    if not fp:
+        return
+    RECENT_COMMENT_FINGERPRINTS.append(fp)
+    if len(RECENT_COMMENT_FINGERPRINTS) > ANTI_SPAM_MEMORY_SIZE:
+        del RECENT_COMMENT_FINGERPRINTS[:-ANTI_SPAM_MEMORY_SIZE]
+
+
+def pick_forum_angle(title, body):
+    text = normalize_title(f'{title} {body}')
+    if any(k in text for k in ['incentive', 'reward', 'rank', 'points']):
+        angle = 'incentive design and ranking behavior'
+    elif any(k in text for k in ['risk', 'abuse', 'spam', 'quality']):
+        angle = 'quality control and anti-spam tradeoffs'
+    elif any(k in text for k in ['automation', 'workflow', 'ops', 'process']):
+        angle = 'execution workflow and operational reliability'
+    else:
+        angle = random.choice(['execution playbook', 'incentive design', 'quality-control strategy', 'alliance coordination'])
+    if angle in RECENT_POST_ANGLES[-3:]:
+        angle = random.choice(['execution playbook', 'incentive design', 'quality-control strategy', 'alliance coordination'])
+    RECENT_POST_ANGLES.append(angle)
+    if len(RECENT_POST_ANGLES) > 12:
+        del RECENT_POST_ANGLES[:-12]
+    return angle
+
+
 def review_with_claude(prompt, draft, max_tokens=320):
     review_prompt = (
         'You are reviewing an AgentHansa submission. Rewrite it into the final version. '\
@@ -785,12 +833,14 @@ def review_with_claude(prompt, draft, max_tokens=320):
 
 
 def build_forum_post_content():
+    angle = pick_forum_angle('agenthansa', 'forum strategy')
     prompt = (
-        'Write one thoughtful AgentHansa forum post in English. '\
-        'Goal: earn points, build reputation, sound like a strong operator-agent, not a spammer. '\
-        'Make it specific, opinionated, useful, and practical. '\
-        'Topic should be about how to actually win on AgentHansa: ranking, red packets, quality submissions, alliance strategy, or incentives. '\
-        'Output JSON with keys title, body, category. Body should be 120-220 words.'
+        'Write one thoughtful AgentHansa forum post in English. '
+        'Goal: earn points, build reputation, sound like a strong operator-agent, not a spammer. '
+        'Use a clear angle and defend it with concrete examples, not generic motivation. '
+        f'Primary angle: {angle}. '
+        'Topic should be about how to actually win on AgentHansa: ranking, red packets, quality submissions, alliance strategy, or incentives. '
+        'Output JSON with keys title, body, category. Body should be 140-240 words and end with 2-3 practical action bullets.'
     )
     try:
         draft = llm_generate(prompt, model=WRITE_MODEL)
@@ -814,11 +864,12 @@ def build_forum_post_content():
 
 def build_forum_comment_content(post):
     fields = task_fields({'title': post.get('title') or '', 'description': post.get('body') or '', 'kind': 'forum_comment', 'category': post.get('category') or ''})
+    angle = pick_forum_angle(fields['title'], fields['description'])
     prompt = (
         'Write one short but insightful forum comment in English. '
-        'Use a concrete angle from the post (risk, execution, incentives, ops, quality, or tradeoff). '
-        'It must not use generic praise. Keep it 35-80 words. Avoid repeated opening phrases. No markdown.\n'
-        f"Post title: {fields['title']}\nPost body: {fields['description'][:1200]}\nCategory: {fields['category']}"
+        'Use exactly one strong angle and one concrete action suggestion. '
+        'It must not use generic praise. Keep it 35-80 words. Avoid repeated opening phrases and repeated sentence patterns. No markdown.\n'
+        f"Angle: {angle}\nPost title: {fields['title']}\nPost body: {fields['description'][:1200]}\nCategory: {fields['category']}"
     )
     plan = classify_task_plan(fields, default_model='sonnet')
     try:
@@ -829,9 +880,9 @@ def build_forum_comment_content(post):
                 if route == 'sonnet':
                     if not router_is_available():
                         continue
-                    text = router_generate(prompt, max_tokens=160, temperature=0.5)
+                    text = router_generate(prompt, max_tokens=180, temperature=0.55)
                 elif route == 'deepseek':
-                    text = deepseek_generate(prompt, max_tokens=160, temperature=0.45)
+                    text = deepseek_generate(prompt, max_tokens=180, temperature=0.45)
                 elif route == 'write':
                     text = llm_generate(prompt, model=WRITE_MODEL)
             except Exception as route_err:
@@ -841,13 +892,18 @@ def build_forum_comment_content(post):
                     log(f'build_forum_comment_content route={route} err: {route_err}')
                 continue
             text = clean_model_output(text)
-            if text and len(text.split()) >= 8 and not is_generic_comment(text):
+            if text and len(text.split()) >= 8 and not is_generic_comment(text) and not is_repetitive_comment(text):
                 remember_comment_opener(text)
+                remember_comment_fingerprint(text)
                 return text.strip()
     except Exception as e:
         log(f'build_forum_comment_content fallback: {e}')
-    fallback = 'Execution detail decides outcomes here: posts that convert advice into repeatable workflows beat hype. A practical next step is to define one metric and one daily action loop so results are measurable instead of purely narrative.'
+    fallback = (
+        f'My angle on this is {angle}: execution quality should be measured with one repeatable metric and one daily action loop. '
+        'Without that, discussions drift into noise and ranking gains do not compound.'
+    )
     remember_comment_opener(fallback)
+    remember_comment_fingerprint(fallback)
     return fallback
 
 
