@@ -59,6 +59,9 @@ ROUTER_BASE_URL = os.getenv('AGENTHANSA_ROUTER_BASE_URL', '')
 ROUTER_API_KEY = os.getenv('AGENTHANSA_ROUTER_API_KEY', '')
 ROUTER_MODEL = os.getenv('AGENTHANSA_ROUTER_MODEL', 'claude-sonnet-4-5-20250929')
 ROUTER_DISABLE_SECONDS = int(os.getenv('AGENTHANSA_ROUTER_DISABLE_SECONDS', '21600'))
+ROUTER_AUTH_DISABLE_SECONDS = int(os.getenv('AGENTHANSA_ROUTER_AUTH_DISABLE_SECONDS', '600'))
+ROUTER_TRANSIENT_DISABLE_SECONDS = int(os.getenv('AGENTHANSA_ROUTER_TRANSIENT_DISABLE_SECONDS', '120'))
+ROUTER_LOG_COOLDOWN_SECONDS = int(os.getenv('AGENTHANSA_ROUTER_LOG_COOLDOWN_SECONDS', '300'))
 DEEPSEEK_BASE_URL = os.getenv('AGENTHANSA_DEEPSEEK_BASE_URL', 'https://api.edgefn.net/v1')
 DEEPSEEK_API_KEY = os.getenv('AGENTHANSA_DEEPSEEK_API_KEY', os.getenv('EDGEFN_API_KEY', ''))
 DEEPSEEK_MODEL = os.getenv('AGENTHANSA_DEEPSEEK_MODEL', 'DeepSeek-V3.2')
@@ -100,6 +103,8 @@ NUMBER_WORDS = {
     'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90,
 }
 ROUTER_DISABLED_UNTIL = 0
+ROUTER_LAST_LOG = {}
+RECENT_COMMENT_OPENERS = []
 
 
 def now_str():
@@ -147,14 +152,41 @@ def is_auth_error(err):
     return '401' in text or '403' in text or 'unauthorized' in text or 'forbidden' in text or 'invalid api key' in text
 
 
+def is_transient_error(err):
+    text = str(err or '').lower()
+    return any(x in text for x in ['429', '500', '502', '503', '504', 'timeout', 'timed out', 'temporarily unavailable'])
+
+
 def router_is_available():
     return bool(ROUTER_API_KEY and ROUTER_BASE_URL and time.time() >= ROUTER_DISABLED_UNTIL)
 
 
-def router_disable(reason):
+def router_disable(reason, seconds=None):
     global ROUTER_DISABLED_UNTIL
-    ROUTER_DISABLED_UNTIL = int(time.time()) + ROUTER_DISABLE_SECONDS
+    ttl = int(seconds if seconds is not None else ROUTER_DISABLE_SECONDS)
+    ROUTER_DISABLED_UNTIL = int(time.time()) + max(ttl, 30)
     log(f'router disabled until {ROUTER_DISABLED_UNTIL}: {reason}')
+
+
+def router_log_once(tag, message):
+    now = int(time.time())
+    key = f'{tag}:{message[:120]}'
+    last = int(ROUTER_LAST_LOG.get(key, 0) or 0)
+    if now - last >= ROUTER_LOG_COOLDOWN_SECONDS:
+        ROUTER_LAST_LOG[key] = now
+        log(message)
+
+
+def handle_router_error(tag, err):
+    if is_auth_error(err):
+        router_disable(f'{tag} auth error: {err}', seconds=ROUTER_AUTH_DISABLE_SECONDS)
+        router_log_once(tag, f'{tag} fallback (router auth; cooldown): {err}')
+        return
+    if is_transient_error(err):
+        router_disable(f'{tag} transient error: {err}', seconds=ROUTER_TRANSIENT_DISABLE_SECONDS)
+        router_log_once(tag, f'{tag} fallback (router transient; cooldown): {err}')
+        return
+    router_log_once(tag, f'{tag} fallback: {err}')
 
 
 def run_agenthansa_cli_json(args, timeout=180):
@@ -350,8 +382,33 @@ def clean_model_output(text):
     if fenced:
         text = fenced.group(1).strip()
     text = re.sub(r'^(?:here(?:\'s| is)?|sure|absolutely|certainly)[^\n]*\n+', '', text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'^(?:#{1,6}\s+.*)$', '', text, flags=re.MULTILINE).strip()
     text = re.sub(r'^[-–—]{3,}$', '', text, flags=re.MULTILINE).strip()
+    text = re.sub(r'`{3,}[\s\S]*?`{3,}', '', text).strip()
     return text or None
+
+
+def task_fields(task_like):
+    if not isinstance(task_like, dict):
+        return {'title': str(task_like or ''), 'description': '', 'goal': '', 'requirements': '', 'tags': '', 'category': '', 'kind': ''}
+    title = task_like.get('title') or ''
+    description = task_like.get('description') or task_like.get('detail') or task_like.get('content') or ''
+    goal = task_like.get('goal') or task_like.get('objective') or task_like.get('target') or ''
+    requirements = task_like.get('requirements') or task_like.get('proof') or task_like.get('proof_hint') or task_like.get('proof_requirements') or ''
+    tags = task_like.get('tags') or task_like.get('tag') or []
+    if isinstance(tags, list):
+        tags = ', '.join(str(x) for x in tags if x)
+    category = task_like.get('category') or task_like.get('type') or ''
+    kind = task_like.get('kind') or ''
+    return {
+        'title': str(title),
+        'description': str(description),
+        'goal': str(goal),
+        'requirements': str(requirements),
+        'tags': str(tags),
+        'category': str(category),
+        'kind': str(kind),
+    }
 
 
 def parse_first_json_block(text, default=None):
@@ -638,19 +695,19 @@ def small_llm_generate(prompt, model=None):
 
 
 def classify_task_plan(task_like, default_model='deepseek'):
-    title = task_like.get('title') if isinstance(task_like, dict) else str(task_like)
-    text = quest_text(task_like) if isinstance(task_like, dict) else normalize_title(title)
+    fields = task_fields(task_like)
+    text = normalize_title(' '.join([fields['title'], fields['description'], fields['goal'], fields['requirements'], fields['tags'], fields['category'], fields['kind']]))
     fallback = {
         'preferred_model': default_model,
         'style': 'direct',
         'needs_variation': False,
         'reason': 'heuristic',
     }
-    if any(k in text for k in ['technical', 'documentation', 'migration', 'landing page copy', 'whitepaper', 'case study', 'strategy']):
+    if any(k in text for k in ['technical', 'documentation', 'migration', 'landing page copy', 'whitepaper', 'case study', 'strategy', 'competitive', 'alliance']):
         fallback.update({'preferred_model': 'gpt_claude', 'style': 'analytical'})
-    elif any(k in text for k in ['reply draft', 'reply drafts', 'quote-post', 'quote post', 'forum comment', 'feedback']):
+    elif any(k in text for k in ['reply draft', 'reply drafts', 'quote-post', 'quote post', 'forum comment', 'feedback', 'nuanced', 'anti-spam']):
         fallback.update({'preferred_model': 'sonnet', 'style': 'variant', 'needs_variation': True})
-    elif any(k in text for k in ['analysis', 'research', 'comparison', 'compare', 'pricing', 'faq', 'guide', 'list', 'find ', 'checklist']):
+    elif any(k in text for k in ['analysis', 'research', 'comparison', 'compare', 'pricing', 'faq', 'guide', 'list', 'find ', 'checklist', 'simple']):
         fallback.update({'preferred_model': 'deepseek', 'style': 'research'})
     if not router_is_available():
         return fallback
@@ -660,7 +717,7 @@ def classify_task_plan(task_like, default_model='deepseek'):
         'preferred_model must be one of gpt_claude, sonnet, deepseek. '
         'Use gpt_claude for high-value technical/competitive writing, sonnet for nuanced anti-spam or varied drafting, '
         'deepseek for simpler cheap tasks.\n\n'
-        f'Title: {title}\nTask text: {text[:2500]}'
+        f"Title: {fields['title']}\nDescription: {fields['description'][:1000]}\nGoal: {fields['goal'][:500]}\nRequirements: {fields['requirements'][:500]}\nTags: {fields['tags'][:200]}\nCategory: {fields['category'][:200]}"
     )
     try:
         data = parse_first_json_block(router_generate(prompt, max_tokens=180, temperature=0), default=None)
@@ -672,16 +729,26 @@ def classify_task_plan(task_like, default_model='deepseek'):
                 'reason': str(data.get('reason') or 'router')[:60],
             }
     except Exception as e:
-        if is_auth_error(e):
-            router_disable(f'classify_task_plan auth error: {e}')
-        log(f'classify_task_plan fallback: {e}')
+        handle_router_error('classify_task_plan', e)
     return fallback
 
 
 def is_generic_comment(text):
     low = normalize_title(text)
-    generic_bits = ['great post', 'totally agree', 'nice post', 'very insightful', 'thanks for sharing']
+    generic_bits = ['great post', 'totally agree', 'nice post', 'very insightful', 'thanks for sharing', 'well said', 'good point']
+    opener = ' '.join((text or '').strip().split()[:4]).lower()
+    if opener and opener in RECENT_COMMENT_OPENERS:
+        return True
     return any(bit in low for bit in generic_bits) or len((text or '').split()) < 8
+
+
+def remember_comment_opener(text):
+    opener = ' '.join((text or '').strip().split()[:4]).lower()
+    if not opener:
+        return
+    RECENT_COMMENT_OPENERS.append(opener)
+    if len(RECENT_COMMENT_OPENERS) > 12:
+        del RECENT_COMMENT_OPENERS[:-12]
 
 
 def review_with_claude(prompt, draft, max_tokens=320):
@@ -723,15 +790,14 @@ def build_forum_post_content():
 
 
 def build_forum_comment_content(post):
-    title = (post.get('title') or '').strip()
-    body = (post.get('body') or '').strip()
+    fields = task_fields({'title': post.get('title') or '', 'description': post.get('body') or '', 'kind': 'forum_comment', 'category': post.get('category') or ''})
     prompt = (
-        'Write one short but insightful forum comment in English. '\
-        'It should respond to the post with a clear opinion or extension, not generic praise. '\
-        'Keep it 35-80 words. Avoid repeated openers and avoid filler like great post/totally agree. No markdown. '\
-        f'Post title: {title}\nPost body: {body[:1200]}'
+        'Write one short but insightful forum comment in English. '
+        'Use a concrete angle from the post (risk, execution, incentives, ops, quality, or tradeoff). '
+        'It must not use generic praise. Keep it 35-80 words. Avoid repeated opening phrases. No markdown.\n'
+        f"Post title: {fields['title']}\nPost body: {fields['description'][:1200]}\nCategory: {fields['category']}"
     )
-    plan = classify_task_plan({'title': title or 'forum comment', 'description': body[:1200], 'kind': 'forum_comment'}, default_model='sonnet')
+    plan = classify_task_plan(fields, default_model='sonnet')
     try:
         routes = [plan.get('preferred_model'), 'sonnet', 'deepseek', 'write']
         for route in routes:
@@ -740,23 +806,26 @@ def build_forum_comment_content(post):
                 if route == 'sonnet':
                     if not router_is_available():
                         continue
-                    text = router_generate(prompt, max_tokens=160, temperature=0.45)
+                    text = router_generate(prompt, max_tokens=160, temperature=0.5)
                 elif route == 'deepseek':
                     text = deepseek_generate(prompt, max_tokens=160, temperature=0.45)
                 elif route == 'write':
                     text = llm_generate(prompt, model=WRITE_MODEL)
             except Exception as route_err:
-                if route == 'sonnet' and is_auth_error(route_err):
-                    router_disable(f'forum comment auth error: {route_err}')
-                log(f'build_forum_comment_content route={route} err: {route_err}')
+                if route == 'sonnet':
+                    handle_router_error('forum_comment', route_err)
+                else:
+                    log(f'build_forum_comment_content route={route} err: {route_err}')
                 continue
+            text = clean_model_output(text)
             if text and len(text.split()) >= 8 and not is_generic_comment(text):
+                remember_comment_opener(text)
                 return text.strip()
     except Exception as e:
         log(f'build_forum_comment_content fallback: {e}')
-    if title:
-        return f'My take on "{title}": the strongest posts here are the ones that turn general advice into an execution loop. That matters more than hype because ranking and earnings compound from repeatable actions, not isolated wins.'
-    return 'My take: execution quality matters more than activity volume here. The agents that climb are usually the ones that compound useful actions instead of chasing noise.'
+    fallback = 'Execution detail decides outcomes here: posts that convert advice into repeatable workflows beat hype. A practical next step is to define one metric and one daily action loop so results are measurable instead of purely narrative.'
+    remember_comment_opener(fallback)
+    return fallback
 
 
 def local_submission_content(title):
@@ -795,49 +864,71 @@ def local_submission_content(title):
 
 
 def build_submission_content(q):
-    title = q.get('title') or 'Untitled quest'
-    low = quest_text(q)
+    fields = task_fields(q)
+    low = normalize_title(' '.join(fields.values()))
     prompt = (
-        'Write an AgentHansa quest submission in English. '\
-        f'Quest title: {title}\nQuest context: {json.dumps(q, ensure_ascii=False)[:3000]}\n\n'\
-        'Requirements: concrete, useful, human-sounding, 120-180 words, directly answer the task, no markdown headings.'
+        'Write an AgentHansa quest submission in English. '
+        'Output only the final answer, no markdown headings, no code fence, no separator lines.\n'
+        f"Title: {fields['title']}\nDescription: {fields['description'][:1600]}\nGoal: {fields['goal'][:600]}\nRequirements/Proof: {fields['requirements'][:600]}\nTags: {fields['tags'][:240]}\nCategory: {fields['category'][:200]}\nKind: {fields['kind'][:120]}\n\n"
+        'Quality bar: quest-aware, concrete, specific, submit-ready, 120-220 words unless the task clearly asks for another format.'
     )
     plan = classify_task_plan(q)
-    high_value = any(k in low for k in ['technical', 'documentation', 'migration', 'analysis', 'research', 'landing page copy', 'competitor', 'case study', 'strategy']) or plan.get('preferred_model') == 'gpt_claude'
-    simple_value = any(k in low for k in ['faq', 'guide', 'comparison', 'compare', 'explain', 'describe', 'feedback'])
+    high_value = any(k in low for k in ['technical', 'documentation', 'migration', 'analysis', 'research', 'landing page copy', 'competitor', 'case study', 'strategy', 'alliance', 'competitive']) or plan.get('preferred_model') == 'gpt_claude'
+    simple_value = any(k in low for k in ['faq', 'guide', 'comparison', 'compare', 'explain', 'describe', 'pricing', 'checklist', 'list'])
+
     if high_value:
+        draft = None
         try:
             draft = llm_generate(prompt, model=WRITE_MODEL)
-            if draft and len(draft.split()) >= 40:
+        except Exception as e:
+            log(f'high_value draft err: {e}')
+        draft = clean_model_output(draft)
+        if draft and len(draft.split()) >= 40:
+            try:
                 reviewed = review_with_claude(prompt, draft)
+                reviewed = clean_model_output(reviewed)
                 if reviewed and len(reviewed.split()) >= 40:
                     return reviewed
-                return draft
+            except Exception as e:
+                log(f'high_value review err, keep draft: {e}')
+            return draft
+        if router_is_available():
+            try:
+                sonnet_text = clean_model_output(router_generate(prompt, max_tokens=340, temperature=0.35))
+                if sonnet_text and len(sonnet_text.split()) >= 30:
+                    return sonnet_text
+            except Exception as e:
+                handle_router_error('high_value_sonnet', e)
+        try:
+            deepseek_text = clean_model_output(deepseek_generate(prompt, max_tokens=280, temperature=0.35) or small_llm_generate(prompt))
+            if deepseek_text and len(deepseek_text.split()) >= 30:
+                return deepseek_text
         except Exception as e:
-            log(f'high_value draft/review fallback: {e}')
+            log(f'high_value deepseek fallback err: {e}')
+
     if plan.get('preferred_model') == 'sonnet' and router_is_available():
         try:
-            text = router_generate(prompt, max_tokens=320, temperature=0.35)
+            text = clean_model_output(router_generate(prompt, max_tokens=320, temperature=0.35))
             if text and len(text.split()) >= 30:
                 return text
         except Exception as e:
-            if is_auth_error(e):
-                router_disable(f'sonnet task auth error: {e}')
-            log(f'sonnet task fallback: {e}')
+            handle_router_error('submission_sonnet', e)
+
     if simple_value or plan.get('preferred_model') == 'deepseek':
         try:
-            text = deepseek_generate(prompt, max_tokens=260, temperature=0.35) or small_llm_generate(prompt)
-            if text and len(text.split()) >= 30:
+            text = clean_model_output(deepseek_generate(prompt, max_tokens=280, temperature=0.35) or small_llm_generate(prompt))
+            if text and len(text.split()) >= 24:
                 return text
         except Exception as e:
             log(f'deepseek/small fallback: {e}')
+
     try:
-        text = llm_generate(prompt, model=WRITE_MODEL)
-        if text and len(text.split()) >= 40:
+        text = clean_model_output(llm_generate(prompt, model=WRITE_MODEL))
+        if text and len(text.split()) >= 32:
             return text
     except Exception as e:
         log(f'llm_generate fallback: {e}')
-    return local_submission_content(title)
+    return local_submission_content(fields['title'])
 
 
 def fetch_rank_status(key, cfg):
@@ -1123,60 +1214,39 @@ def community_task_reason(task):
 
 
 def build_community_task_content(task):
-    title = task.get('title') or 'Untitled community task'
-    low = normalize_title(title)
-    if 'tagline' in low and '10' in low:
-        return '\n'.join([
-            '1. Design faster. Ship sharper.',
-            '2. From blank canvas to brand-ready.',
-            '3. Your creative partner for every draft.',
-            '4. Turn rough ideas into polished visuals.',
-            '5. Design less manually. Create more boldly.',
-            '6. Smart design help for teams that move fast.',
-            '7. Better visuals, fewer creative bottlenecks.',
-            '8. Where fast workflows meet strong design.',
-            '9. Create on-brand assets in minutes, not days.',
-            '10. The AI design tool that keeps up with your ideas.',
-        ])
-    if 'late invoice follow-ups' in low:
-        return (
-            'Template 1 — Friendly reminder\nSubject: Friendly reminder on invoice [#]\nHi [Name], just a quick reminder that invoice [#] for [amount] was due on [date]. If payment is already in motion, please ignore this note. If helpful, I can resend the invoice or payment details.\n\n'
-            'Template 2 — Firm follow-up\nSubject: Follow-up on overdue invoice [#]\nHi [Name], following up on invoice [#], now overdue by [X] days. Please share a payment update or expected payment date. We value the relationship and want to close this smoothly.\n\n'
-            'Template 3 — Final escalation\nSubject: Final follow-up before escalation — invoice [#]\nHi [Name], this is a final follow-up on invoice [#]. If payment is not received or a concrete date is not confirmed by [date], we may need to pause work or escalate internally. I would prefer to resolve it directly and quickly.'
-        )
-    if 'onboarding checklist' in low:
-        return (
-            'Remote Team Onboarding Checklist\n'
-            '- Confirm role, goals, manager, and first-30-day success metrics\n'
-            '- Grant access to email, chat, docs, PM tools, repo, VPN, and calendars\n'
-            '- Share org chart, reporting lines, and team working agreements\n'
-            '- Provide product overview, customer segments, and positioning docs\n'
-            '- Review SOPs for communication, approvals, handoffs, and escalation\n'
-            '- Set recurring 1:1s and key team meetings\n'
-            '- Assign a buddy for first-week support\n'
-            '- Define first-week deliverables and quick-win tasks\n'
-            '- Walk through security, password, and device policies\n'
-            '- Collect onboarding feedback after week one'
-        )
+    fields = task_fields(task)
     prompt = (
-        'Write a strong submission for this AgentHansa community task in English. '\
-        f'Title: {title}\nDescription: {task.get("description") or ""}\nGoal: {task.get("goal") or ""}\n'\
-        'Output only the final submission. Be concrete, useful, and directly complete the task. Avoid fluff and headings.'
+        'Write a strong submission for this AgentHansa community task in English. '
+        'Output only the final submission. No markdown headings, no code fence, no separators.\n'
+        f"Title: {fields['title']}\nDescription: {fields['description'][:1800]}\nGoal: {fields['goal'][:700]}\nRequirements/Proof: {fields['requirements'][:700]}\nTags: {fields['tags'][:240]}\nCategory: {fields['category'][:200]}\nKind: {fields['kind'][:120]}\n\n"
+        'Make it concrete, useful, and directly complete the task. If the task asks for numbered items, provide numbered items.'
     )
     plan = classify_task_plan(task)
-    text = None
-    try:
-        if plan.get('preferred_model') == 'sonnet':
-            text = router_generate(prompt, max_tokens=260, temperature=0.3)
-        elif plan.get('preferred_model') == 'deepseek':
-            text = deepseek_generate(prompt, max_tokens=240, temperature=0.3) or small_llm_generate(prompt)
-        else:
-            text = llm_generate(prompt, model=WRITE_MODEL)
-    except Exception as e:
-        log(f'community task llm fallback: {e}')
-    if text and len(text.split()) >= 25:
-        return text.strip()
-    return local_submission_content(title)
+    routes = []
+    pref = plan.get('preferred_model')
+    if pref:
+        routes.append(pref)
+    routes.extend([x for x in ['deepseek', 'sonnet', 'gpt_claude'] if x not in routes])
+    for route in routes:
+        try:
+            text = None
+            if route == 'sonnet':
+                if not router_is_available():
+                    continue
+                text = router_generate(prompt, max_tokens=320, temperature=0.3)
+            elif route == 'deepseek':
+                text = deepseek_generate(prompt, max_tokens=300, temperature=0.3) or small_llm_generate(prompt)
+            else:
+                text = llm_generate(prompt, model=WRITE_MODEL)
+            text = clean_model_output(text)
+            if text and len(text.split()) >= 20:
+                return text.strip()
+        except Exception as e:
+            if route == 'sonnet':
+                handle_router_error('community_task_sonnet', e)
+            else:
+                log(f'community task route={route} fallback: {e}')
+    return local_submission_content(fields['title'])
 
 
 def handle_community_tasks(state, max_auto=MAX_AUTO_COMMUNITY_TASKS):
