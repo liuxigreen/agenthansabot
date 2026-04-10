@@ -46,6 +46,8 @@ OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
 OPENAI_MODEL = os.getenv('AGENTHANSA_LLM_MODEL', os.getenv('AGENTHANSA_WRITE_MODEL', 'gpt-4o-mini'))
 WRITE_MODEL = os.getenv('AGENTHANSA_WRITE_MODEL', OPENAI_MODEL)
 REVIEW_MODEL = os.getenv('AGENTHANSA_REVIEW_MODEL', 'claude-sonnet-4-6')
+REVIEW_DISABLE_SECONDS = int(os.getenv('AGENTHANSA_REVIEW_DISABLE_SECONDS', '300'))
+REVIEW_AUTH_DISABLE_SECONDS = int(os.getenv('AGENTHANSA_REVIEW_AUTH_DISABLE_SECONDS', '1800'))
 SMALL_MODELS = [x.strip() for x in os.getenv('AGENTHANSA_SMALL_MODELS', 'GLM-5,MiniMax-M2.5').split(',') if x.strip()]
 NOTIFY_ENABLE = os.getenv('AGENTHANSA_NOTIFY_ENABLE', '1').lower() in {'1','true','yes','on'}
 NOTIFY_CHANNEL = os.getenv('AGENTHANSA_NOTIFY_CHANNEL', '1491606943670730803')
@@ -110,6 +112,7 @@ ROUTER_LAST_LOG = {}
 RECENT_COMMENT_OPENERS = []
 RECENT_COMMENT_FINGERPRINTS = []
 RECENT_POST_ANGLES = []
+REVIEW_DISABLED_UNTIL = 0
 
 
 def sync_runtime_memory_from_state(state):
@@ -211,6 +214,17 @@ def handle_router_error(tag, err):
         router_log_once(tag, f'{tag} fallback (router transient; cooldown): {err}')
         return
     router_log_once(tag, f'{tag} fallback: {err}')
+
+
+def review_is_available():
+    return bool(DEROUTER_API_KEY and time.time() >= REVIEW_DISABLED_UNTIL)
+
+
+def review_disable(reason, seconds=None):
+    global REVIEW_DISABLED_UNTIL
+    ttl = int(seconds if seconds is not None else REVIEW_DISABLE_SECONDS)
+    REVIEW_DISABLED_UNTIL = int(time.time()) + max(ttl, 30)
+    log(f'review disabled until {REVIEW_DISABLED_UNTIL}: {reason}')
 
 
 def run_agenthansa_cli_json(args, timeout=180):
@@ -845,13 +859,22 @@ def pick_forum_angle(title, body):
 
 
 def review_with_claude(prompt, draft, max_tokens=320):
+    if not review_is_available():
+        return None
     review_prompt = (
         'You are reviewing an AgentHansa submission. Rewrite it into the final version. '\
         'Keep the strongest ideas, remove fluff, make it more specific and natural, and ensure it sounds credible and submit-ready. '\
         'Output only the final submission in English, no headings.\n\n' +
         f'Original task:\n{prompt}\n\nDraft:\n{draft}'
     )
-    return openai_compatible_generate(DEROUTER_BASE_URL, DEROUTER_API_KEY, REVIEW_MODEL, review_prompt, max_tokens=max_tokens, temperature=0.35)
+    try:
+        return openai_compatible_generate(DEROUTER_BASE_URL, DEROUTER_API_KEY, REVIEW_MODEL, review_prompt, max_tokens=max_tokens, temperature=0.35)
+    except Exception as e:
+        if is_auth_error(e):
+            review_disable(f'auth error: {e}', seconds=REVIEW_AUTH_DISABLE_SECONDS)
+        elif is_transient_error(e):
+            review_disable(f'transient error: {e}', seconds=REVIEW_DISABLE_SECONDS)
+        raise
 
 
 def build_forum_post_content():
