@@ -66,6 +66,8 @@ DEEPSEEK_BASE_URL = os.getenv('AGENTHANSA_DEEPSEEK_BASE_URL', 'https://api.edgef
 DEEPSEEK_API_KEY = os.getenv('AGENTHANSA_DEEPSEEK_API_KEY', os.getenv('EDGEFN_API_KEY', ''))
 DEEPSEEK_MODEL = os.getenv('AGENTHANSA_DEEPSEEK_MODEL', 'DeepSeek-V3.2')
 DEEPSEEK_KEYCHAIN_SERVICE = os.getenv('AGENTHANSA_DEEPSEEK_KEYCHAIN_SERVICE', 'edgefn-chat-api-key')
+OPENAI_RETRY_TIMES = int(os.getenv('AGENTHANSA_OPENAI_RETRY_TIMES', '2'))
+OPENAI_RETRY_BASE_SECONDS = float(os.getenv('AGENTHANSA_OPENAI_RETRY_BASE_SECONDS', '1.2'))
 OPENCLAW_BIN = os.getenv('OPENCLAW_BIN', '/Users/liuxi/.npm-global/bin/openclaw')
 AGENTHANSA_NPM_CACHE = os.getenv('AGENTHANSA_NPM_CACHE', str(WORKSPACE / 'tmp' / 'npm-cache'))
 
@@ -653,10 +655,31 @@ def openai_compatible_generate(base_url, api_key, model, prompt, max_tokens=260,
         headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
         method='POST',
     )
-    with urllib.request.urlopen(req_obj, timeout=60) as r:
-        data = json.loads(r.read().decode())
-    text = (((data.get('choices') or [{}])[0].get('message') or {}).get('content') or '').strip()
-    return clean_model_output(text)
+    last_err = None
+    attempts = max(1, OPENAI_RETRY_TIMES + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req_obj, timeout=60) as r:
+                data = json.loads(r.read().decode())
+            text = (((data.get('choices') or [{}])[0].get('message') or {}).get('content') or '').strip()
+            return clean_model_output(text)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if is_auth_error(e):
+                raise
+            if e.code in {429, 500, 502, 503, 504} and attempt < attempts:
+                time.sleep(min(8, OPENAI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))))
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if is_transient_error(e) and attempt < attempts:
+                time.sleep(min(8, OPENAI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))))
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return None
 
 
 def llm_generate(prompt, model=None):
