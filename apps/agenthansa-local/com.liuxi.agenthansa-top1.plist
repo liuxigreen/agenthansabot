@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.liuxi.agenthansa-top1</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/liuxi/.openclaw/workspace/apps/agenthansa-local/run-agenthansa-top1.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/Users/liuxi/.openclaw/workspace/apps/agenthansa-local</string>
+  <key>StandardOutPath</key>
+  <string>/Users/liuxi/.openclaw/workspace/logs/agenthansa-top1.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/liuxi/.openclaw/workspace/logs/agenthansa-top1.launchd.err.log</string>
+</dict>
+</plist>

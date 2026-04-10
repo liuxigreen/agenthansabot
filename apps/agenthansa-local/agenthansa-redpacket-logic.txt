@@ -1,0 +1,144 @@
+AgentHansa 红包检查 / 抢红包逻辑整理
+
+文件来源：
+- /Users/liuxi/.openclaw/workspace/apps/agenthansa-local/agenthansa-top1.py
+
+一、主入口
+1. run_once()
+   - 调 maybe_watch_redpacket(key, state, my_name)
+   - 这是每轮主循环里负责红包的入口
+
+二、红包检查逻辑
+1. maybe_watch_redpacket(key, state, my_name)
+   - 先调用 /red-packets
+   - 读取：
+     - active
+     - next_packet_seconds
+   - 分支：
+     A. 如果 active 不为空：立刻调用 process_red_packets()
+     B. 如果 next_packet_seconds <= PRE_WATCH_SECONDS：进入 watch 模式
+     C. 否则本轮先不抢，等下一轮主循环
+
+2. watch 模式
+   - 提前 PRE_WATCH_SECONDS 秒进入
+   - 持续时间：min(WATCH_MAX_SECONDS, nxt + 120)
+   - 轮询间隔：0.8 秒 + 随机抖动
+   - 每次轮询继续调用 process_red_packets()
+   - 一旦不是“红包无急单”，立即返回结果
+
+三、当前 active 红包读取
+1. get_active_packet(key)
+   - 调 /red-packets
+   - 只取 active[0]
+   - 返回：
+     - packet
+     - data
+     - err
+
+四、抢红包主逻辑
+1. process_red_packets(key, state, my_name)
+   - 先拿当前 active packet
+   - 如果没有 active：返回“红包无急单”
+   - 然后做两层保护：
+     A. attempted_packets 去重：同一个 packet 已成功抢过，不再重复抢
+     B. join_attempts 限重试：超过最大次数就不再抢
+
+2. 进入 try 流程：
+   - perform_challenge(...)
+   - join_packet(...)
+   - 成功后：
+     - attempted_packets[packet_id] = 当前时间
+     - 清掉 join_attempts[packet_id]
+     - 写 summary.jsonl
+     - 发通知：🧧✅ Red Packet：金额
+
+3. 异常流程：
+   - join_attempts[packet_id] += 1
+   - 写 redpacket_failure 到 summary.jsonl
+   - 发失败通知
+
+五、challenge 前置动作识别
+1. packet_type(packet)
+   根据 title + challenge_description 判断类型：
+   - ref_link
+   - alliance
+   - upvote
+   - comment
+   - post
+   - unknown
+
+2. perform_challenge(key, packet, state, my_name)
+   - comment -> do_forum_comment()
+   - upvote -> ensure_forum_vote(..., force=True)
+   - ref_link -> ensure_ref_link(..., force=True)
+   - alliance -> ensure_alliance_submit(..., force=True)
+   - post -> do_forum_post()，失败则 fallback 到 do_forum_comment()
+
+六、答题 + join 逻辑
+1. join_packet(key, packet_id, max_attempts=2)
+   - 先调 /red-packets/{id}/challenge 取题目
+   - 优先本地规则 solve_question()
+   - 本地规则失败 -> solve_question_with_llm()
+   - 然后 POST /red-packets/{id}/join
+
+2. 错误处理：
+   - Wrong answer / incorrect：切到 LLM 再试
+   - 503 / 429 / unavailable：等待后重试
+   - 其他错误：直接抛异常
+
+3. 成功返回：
+   - question
+   - answer
+   - joined
+   - solver
+   - attempt
+
+七、本地规则答题 solve_question()
+支持的典型题型：
+- half / 剩一半
+- 平分 / equally among / each get
+- 余数 / left over / remainder
+- 乘法 x / *
+- 加减法故事题
+- 范围计数题
+- 单数字直接返回
+
+八、LLM 兜底答题 solve_question_with_llm()
+- prompt：Solve this math problem and return only the final integer
+- 从返回里抽最后一个数字作为答案
+
+九、状态文件
+1. state.json
+   关键字段：
+   - attempted_packets：已成功处理过的红包
+   - join_attempts：失败重试计数
+   - last_ref_epoch
+   - latest_ref_url
+   - last_alliance_epoch
+   - last_vote_up_epoch
+
+2. summary.jsonl
+   成功记录：
+   - redpacket_success
+   - 包含 packet_title / question / answer / solver / attempt / estimated_per_person
+   失败记录：
+   - redpacket_failure
+   - 包含错误摘要
+
+十、当前关键参数（由 .env 控制）
+- AGENTHANSA_PRE_WATCH_SECONDS=90
+- AGENTHANSA_WATCH_MAX_SECONDS=360
+- AGENTHANSA_MAX_JOIN_ATTEMPTS=3
+- AGENTHANSA_RUN_EVERY_SECONDS=600
+
+十一、通知逻辑
+- 成功通知：🧧✅ Red Packet：金额
+- 目标子区：1491606943670730803
+- 通过 openclaw message send 发 Discord channel 通知
+
+十二、当前脚本判断是否正常的观察点
+1. summary.jsonl 是否新增 redpacket_success / redpacket_failure
+2. state.json 里的 attempted_packets 是否新增 packet_id
+3. 子区 1491606943670730803 是否收到：
+   - 🧧✅ Red Packet：金额
+4. launchd 日志里是否还有 notify err

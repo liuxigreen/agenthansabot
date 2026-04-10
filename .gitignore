@@ -1,0 +1,21 @@
+# Sensitive files
+*.env
+config.json
+*secret*
+*token*
+
+# Runtime artifacts
+logs/
+data/
+memory/
+*.log
+*.jsonl
+state.json
+*.out
+*.launchd.out.log
+*.launchd.err.log
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

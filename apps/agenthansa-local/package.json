@@ -1,0 +1,12 @@
+{
+  "name": "agenthansa-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agenthansa-local": "./agenthansa-local.mjs"
+  },
+  "scripts": {
+    "start": "node ./agenthansa-local.mjs --help"
+  }
+}
