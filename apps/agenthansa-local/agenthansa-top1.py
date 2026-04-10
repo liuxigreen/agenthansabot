@@ -112,6 +112,25 @@ RECENT_COMMENT_FINGERPRINTS = []
 RECENT_POST_ANGLES = []
 
 
+def sync_runtime_memory_from_state(state):
+    if not isinstance(state, dict):
+        return
+    openers = state.get('recent_comment_openers') or []
+    fps = state.get('recent_comment_fingerprints') or []
+    angles = state.get('recent_post_angles') or []
+    RECENT_COMMENT_OPENERS[:] = [str(x) for x in openers if x][-ANTI_SPAM_MEMORY_SIZE:]
+    RECENT_COMMENT_FINGERPRINTS[:] = [str(x) for x in fps if x][-ANTI_SPAM_MEMORY_SIZE:]
+    RECENT_POST_ANGLES[:] = [str(x) for x in angles if x][-ANTI_SPAM_MEMORY_SIZE:]
+
+
+def sync_runtime_memory_to_state(state):
+    if not isinstance(state, dict):
+        return
+    state['recent_comment_openers'] = RECENT_COMMENT_OPENERS[-ANTI_SPAM_MEMORY_SIZE:]
+    state['recent_comment_fingerprints'] = RECENT_COMMENT_FINGERPRINTS[-ANTI_SPAM_MEMORY_SIZE:]
+    state['recent_post_angles'] = RECENT_POST_ANGLES[-ANTI_SPAM_MEMORY_SIZE:]
+
+
 def now_str():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -345,10 +364,13 @@ def load_cfg():
 
 
 def load_state():
-    return read_json(STATE, {})
+    state = read_json(STATE, {})
+    sync_runtime_memory_from_state(state)
+    return state
 
 
 def save_state(state):
+    sync_runtime_memory_to_state(state)
     write_json(STATE, state)
 
 
