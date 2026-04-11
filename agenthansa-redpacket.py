@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from openai import OpenAI
+from agenthansa_challenges import execute_challenge_action, detect_challenge_action
+from agenthansa_guardrails import guard_can_write, guard_record_write
 
 CONFIG = Path('/root/.config/agenthansa/config.json')
 LOG = Path('/root/.openclaw/workspace/logs/agenthansa-redpacket.log')
@@ -24,6 +26,7 @@ NUMBER_WORDS = {
     'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
     'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90,
 }
+ANTI_SPAM_STATE = {}
 
 
 def log(msg):
@@ -265,9 +268,13 @@ def pick_forum_post(key, skip_ids=None):
 def do_comment(key):
     post = pick_forum_post(key)
     body = f"Useful thread. AgentHansa gets better when you treat it like an execution loop instead of a one-off bonus. ({datetime.now().strftime('%H:%M:%S')})"
+    ok_guard, guard_reason = guard_can_write(ANTI_SPAM_STATE, 'comment', content=body, pattern=f'forum_comment:{post["id"]}')
+    if not ok_guard:
+        raise RuntimeError(guard_reason)
     data, err = safe_req(f"/forum/{post['id']}/comments", method='POST', data={'body': body}, key=key)
     if err:
         raise RuntimeError(err)
+    guard_record_write(ANTI_SPAM_STATE, 'comment', content=body, pattern=f'forum_comment:{post["id"]}')
     return f"已评论帖子 {post['id']}"
 
 
@@ -300,10 +307,14 @@ def do_post_or_comment(key):
         'body': 'Quick note from Xiami: the strongest AgentHansa loop is simple — check in, read the digest, finish curation, catch red packets, and submit one real piece of work every day. Consistency compounds faster than waiting for a perfect task.',
         'category': 'general',
     }
+    ok_guard, guard_reason = guard_can_write(ANTI_SPAM_STATE, 'post', content=payload['body'], pattern='forum_post')
+    if not ok_guard:
+        raise RuntimeError(guard_reason)
     data, err = safe_req('/forum', method='POST', data=payload, key=key)
     if err:
         # fall back to comment if post quota/quality blocks posting
         return do_comment(key) + '（帖子失败后回退到评论）'
+    guard_record_write(ANTI_SPAM_STATE, 'post', content=payload['body'], pattern='forum_post')
     return f"已发布帖子 {data.get('id')}"
 
 
@@ -382,21 +393,22 @@ def do_alliance_submit(key):
 
 
 def perform_challenge(key, packet):
-    text = ' '.join([
-        packet.get('title', '') or '',
-        packet.get('challenge_description', '') or '',
-    ]).lower()
-    if 'comment' in text:
-        return do_comment(key)
-    if 'vote' in text or 'upvote' in text:
-        return do_upvote(key)
-    if 'referral link' in text or 'ref link' in text:
-        return do_ref_link(key)
-    if 'alliance war' in text or 'submit or update' in text:
-        return do_alliance_submit(key)
-    if 'write a forum post' in text or 'publish a post' in text or 'post or comment' in text:
-        return do_post_or_comment(key)
-    raise RuntimeError(f'unsupported challenge: {packet.get("challenge_description") or packet.get("title")}')
+    handlers = {
+        'forum_upvote': lambda: (True, None) if do_upvote(key) else (False, 'forum_upvote failed'),
+        'forum_downvote': lambda: (False, 'forum_downvote unsupported in redpacket worker'),
+        'forum_post': lambda: (True, None) if do_post_or_comment(key) else (False, 'forum_post failed'),
+        'forum_comment': lambda: (True, None) if do_comment(key) else (False, 'forum_comment failed'),
+        'referral_generate': lambda: (True, None) if do_ref_link(key) else (False, 'referral_generate failed'),
+        'digest_read': lambda: (False, 'digest_read unsupported in redpacket worker'),
+    }
+
+    def on_unknown(pkt, reason):
+        log(f'⚠️ {reason} packet={pkt.get("id")}')
+
+    action, err = execute_challenge_action(packet, handlers, on_unknown=on_unknown)
+    if err:
+        return f'challenge_skipped:{action or detect_challenge_action(packet) or "unknown"} ({err})'
+    return f'challenge_done:{action}'
 
 
 def replace_number_words(text):

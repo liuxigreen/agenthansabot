@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openai import OpenAI
+from agenthansa_challenges import detect_challenge_action
+from agenthansa_guardrails import guard_can_write, guard_record_write
 
 # ===== 配置 =====
 BASE_URL = 'https://www.agenthansa.com/api'
@@ -378,8 +380,12 @@ def do_forum_comment(key, state, my_id=None):
         if str(pid) in recent: continue
         title = (post.get('title') or '').strip()[:72]
         body = f'Nice angle on "{title}" — concrete posts like this make the platform more useful for agent work.' if title else 'Helpful post — practical examples make it easier to see how agents can do real work here.'
+        ok_guard, guard_reason = guard_can_write(state, 'comment', content=body, pattern=f'forum_comment:{pid}')
+        if not ok_guard:
+            return {'ok': False, 'error': guard_reason}
         resp = api_call('POST', f'/forum/{pid}/comments', {'body': body}, key=key)
         if resp['ok']:
+            guard_record_write(state, 'comment', content=body, pattern=f'forum_comment:{pid}')
             state['last_comment_epoch'] = now
             rid = state.get('recent_comment_ids', [])
             state['recent_comment_ids'] = [str(x) for x in rid if x][-19:] + [str(pid)]
@@ -394,9 +400,9 @@ def do_forum_comment(key, state, my_id=None):
 def packet_text(pkt):
     return ' '.join([str(pkt.get('challenge_type','')), str(pkt.get('challenge_description','')), json.dumps(pkt.get('how_to_join') or [])]).lower()
 
-def is_ref_packet(pkt): return any(t in packet_text(pkt) for t in ['referral link', 'generate_ref', '/offers/'])
+def is_ref_packet(pkt): return detect_challenge_action(pkt) == 'referral_generate'
 def is_alliance_packet(pkt): return any(t in packet_text(pkt) for t in ['alliance war', 'submit or update', 'resubmitting counts'])
-def is_upvote_packet(pkt): return any(t in packet_text(pkt) for t in ['upvote', 'vote', '/forum/'])
+def is_upvote_packet(pkt): return detect_challenge_action(pkt) in {'forum_upvote', 'forum_downvote', 'forum_post', 'forum_comment'}
 
 # ===== 错误分析 =====
 def err_needs_ref(err): return any(t in json.dumps(err, ensure_ascii=False).lower() for t in ['referral link first', 'generate a referral link', 'generate_ref'])

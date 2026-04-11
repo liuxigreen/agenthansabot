@@ -10,6 +10,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from agenthansa_runtime_profile import classify_task, classify_task_detail, browser_executor_stub
+from agenthansa_challenges import detect_challenge_action, execute_challenge_action
+from agenthansa_guardrails import guard_can_write, guard_record_write
 
 HOME = Path.home()
 WORKSPACE = Path(os.getenv('AGENTHANSA_WORKSPACE', str(HOME / '.openclaw' / 'workspace')))
@@ -639,8 +641,12 @@ def do_forum_comment(key, state=None):
             continue
         title = (post.get('title') or '').strip()
         body = f'Useful angle on "{title}" — concrete examples like this make the forum more helpful for operators and agents.' if title else 'Helpful post — concrete examples make the forum more useful for operators and agents.'
+        ok_guard, guard_reason = guard_can_write(state, 'comment', content=body, pattern=f'forum_comment:{pid}')
+        if not ok_guard:
+            return False, guard_reason
         _, err = safe_req(f'/forum/{pid}/comments', method='POST', data={'body': body}, key=key)
         if not err:
+            guard_record_write(state, 'comment', content=body, pattern=f'forum_comment:{pid}')
             comment_state['count'] = int(comment_state.get('count', 0) or 0) + 1
             comment_state['post_ids'] = (comment_state.get('post_ids') or []) + [str(pid)]
             return True, None
@@ -686,56 +692,29 @@ def run_browser_executor(task):
         return {**stub, 'ok': False, 'error': str(e)}
 
 
-def redpacket_action_type(packet):
-    text = normalize_title(' '.join([
-        packet.get('title') or '',
-        packet.get('challenge_description') or '',
-    ]))
-    if 'upvote' in text or 'vote up' in text:
-        return 'forum_upvote'
-    if 'downvote' in text or 'vote down' in text:
-        return 'forum_downvote'
-    if 'forum post' in text or 'publish a post' in text:
-        return 'forum_post'
-    if 'comment' in text:
-        return 'forum_comment'
-    if 'referral' in text or 'ref link' in text:
-        return 'referral_generate'
-    if 'digest' in text or 'read forum' in text:
-        return 'digest_read'
-    return None
-
-
 def execute_redpacket_action(key, packet, state):
-    action = redpacket_action_type(packet)
-    if not action:
+    def on_unknown(pkt, reason):
         append_unknown_challenge({
-            'packet_id': packet.get('id'),
-            'title': packet.get('title'),
-            'challenge_description': packet.get('challenge_description'),
-            'context': {'task_type': packet.get('type'), 'status': packet.get('status')},
+            'packet_id': pkt.get('id'),
+            'title': pkt.get('title'),
+            'challenge_description': pkt.get('challenge_description'),
+            'context': {'task_type': pkt.get('type'), 'status': pkt.get('status')},
             'classification': 'unknown',
+            'reason': reason,
         })
-        return None, None
-    if action == 'forum_upvote':
-        ok, err = do_forum_vote_once(key, direction='up')
-        return action, None if ok else err
-    if action == 'forum_downvote':
-        ok, err = do_forum_vote_once(key, direction='down')
-        return action, None if ok else err
-    if action == 'forum_post':
-        ok, err = do_forum_comment(key, state)
-        return 'forum_post_stub_comment', None if ok else err
-    if action == 'forum_comment':
-        ok, err = do_forum_comment(key, state)
-        return action, None if ok else err
-    if action == 'referral_generate':
-        ref_url, err = ensure_distribute_done(key, state)
-        return action, None if ref_url else err
-    if action == 'digest_read':
-        ok, err = do_digest(key)
-        return action, None if ok else err
-    return action, None
+    handlers = {
+        'forum_upvote': lambda: do_forum_vote_once(key, direction='up'),
+        'forum_downvote': lambda: do_forum_vote_once(key, direction='down'),
+        'forum_post': lambda: do_forum_comment(key, state),
+        'forum_comment': lambda: do_forum_comment(key, state),
+        'referral_generate': lambda: ((lambda ref, err: (bool(ref), err))(*ensure_distribute_done(key, state))),
+        'digest_read': lambda: do_digest(key),
+    }
+    return execute_challenge_action(packet, handlers, on_unknown=on_unknown)
+
+
+def browser_executor_available():
+    return bool(BROWSER_EXECUTOR_CMD) and os.path.exists(BROWSER_EXECUTOR_CMD) and os.access(BROWSER_EXECUTOR_CMD, os.X_OK)
 
 
 def do_forum_curation(key, daily):
@@ -848,6 +827,22 @@ def handle_competitive_quests(key, feed_quests, all_quests):
         }
         task_meta = classify_task_detail(q) if RUNTIME_PROFILE == 'mac_openclaw' else {'task_class': 'legacy', 'reason': 'non-mac legacy mode'}
         task_class = task_meta['task_class']
+        if task_class == 'browser_proof_required' and not browser_executor_available():
+            manual.append({
+                **base_item,
+                'reason': 'browser executor unavailable: AGENTHANSA_BROWSER_EXECUTOR_CMD missing/unavailable; skipping browser/proof task',
+                'task_class': 'skip',
+                'task_reason': task_meta.get('reason'),
+                'recommendation': 'skip',
+            })
+            append_task_summary({
+                'status': 'browser_executor_unavailable_skip',
+                'task_class': 'skip',
+                'title': title,
+                'task_reason': task_meta.get('reason'),
+                'browser_executor_cmd': BROWSER_EXECUTOR_CMD,
+            })
+            continue
         if task_class == 'browser_proof_required':
             browser_result = run_browser_executor(q) if RUNTIME_PROFILE == 'mac_openclaw' else browser_executor_stub(q)
             append_task_summary({
