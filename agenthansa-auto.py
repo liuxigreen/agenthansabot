@@ -3,17 +3,22 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from agenthansa_runtime_profile import classify_task, classify_task_detail, browser_executor_stub
 
-CONFIG = Path('/root/.config/agenthansa/config.json')
-LOG = Path('/root/.openclaw/workspace/logs/agenthansa-auto.log')
-STATE = Path('/root/.openclaw/workspace/memory/agenthansa-state.json')
-TASK_SUMMARY = Path('/root/.openclaw/workspace/memory/agenthansa-task-summary.jsonl')
-MANUAL_QUEUE = Path('/root/.openclaw/workspace/memory/agenthansa-manual-quests.json')
+HOME = Path.home()
+WORKSPACE = Path(os.getenv('AGENTHANSA_WORKSPACE', str(HOME / '.openclaw' / 'workspace')))
+CONFIG = Path(os.getenv('AGENTHANSA_CONFIG', str(HOME / '.config' / 'agenthansa' / 'config.json')))
+LOG = Path(os.getenv('AGENTHANSA_LOG', str(WORKSPACE / 'logs' / 'agenthansa-auto.log')))
+STATE = Path(os.getenv('AGENTHANSA_STATE', str(WORKSPACE / 'memory' / 'agenthansa-state.json')))
+TASK_SUMMARY = Path(os.getenv('AGENTHANSA_TASK_SUMMARY', str(WORKSPACE / 'memory' / 'agenthansa-task-summary.jsonl')))
+UNKNOWN_CHALLENGE_LOG = Path(os.getenv('AGENTHANSA_UNKNOWN_CHALLENGE_LOG', str(WORKSPACE / 'memory' / 'agenthansa-unknown-challenges.jsonl')))
+MANUAL_QUEUE = Path(os.getenv('AGENTHANSA_MANUAL_QUEUE', str(WORKSPACE / 'memory' / 'agenthansa-manual-quests.json')))
 BASE = 'https://www.agenthansa.com/api'
 UA = 'OpenClaw-Xiami/1.0'
 EDGEFN_URL = 'https://api.edgefn.net/v1/chat/completions'
@@ -21,14 +26,19 @@ EDGEFN_KEY = os.getenv('EDGEFN_API_KEY', '')
 EDGEFN_WRITE_MODELS = ['GLM-5', 'MiniMax-M2.5']
 DEROUTER_URL = 'https://api.derouter.ai/openai/v1/chat/completions'
 DEROUTER_KEY = os.getenv('DEROUTER_API_KEY', '')
-DEROUTER_DRAFT_MODEL = os.getenv('AGENTHANSA_DRAFT_MODEL', 'gpt-5.4')
-DEROUTER_REVIEW_MODEL = os.getenv('AGENTHANSA_REVIEW_MODEL', 'claude-sonnet-4-6')
+DEROUTER_DRAFT_MODEL = os.getenv('AGENTHANSA_DRAFT_MODEL', 'claude-sonnet-4-5')
+DEROUTER_REVIEW_MODEL = os.getenv('AGENTHANSA_REVIEW_MODEL', 'gpt-5.4')
+HIGH_VALUE_MODE = os.getenv('AGENTHANSA_HIGH_VALUE_MODE', 'B').upper().strip() or 'B'
+HIGH_VALUE_ROUTE = os.getenv('AGENTHANSA_HIGH_VALUE_ROUTE', 'sonnet_draft_gpt_final').strip()
 HIGH_VALUE_REVIEW_USDC = float(os.getenv('AGENTHANSA_HIGH_VALUE_REVIEW_USDC', '20'))
 AUTO_SUBMIT_COMPETITIVE = os.getenv('AGENTHANSA_AUTO_SUBMIT_COMPETITIVE', '1').lower() in {'1', 'true', 'yes', 'on'}
 MAX_AUTO_QUESTS = int(os.getenv('AGENTHANSA_MAX_AUTO_QUESTS', '2'))
-SNIPER_SCRIPT = '/root/.openclaw/workspace/scripts/agenthansa-sniper.py'
+SNIPER_SCRIPT = os.getenv('AGENTHANSA_SNIPER_SCRIPT', str(WORKSPACE / 'scripts' / 'agenthansa-sniper.py'))
+BROWSER_EXECUTOR_CMD = os.getenv('AGENTHANSA_BROWSER_EXECUTOR_CMD', '')
 SAFE_LEAD_TARGET = int(os.getenv('AGENTHANSA_SAFE_LEAD_TARGET', '100'))
 DISTRIBUTE_REFRESH_SECS = int(os.getenv('AGENTHANSA_DISTRIBUTE_REFRESH_SECS', '1800'))
+RUNTIME_PROFILE = os.getenv('AGENTHANSA_RUNTIME_PROFILE', 'mac_openclaw').strip() or 'mac_openclaw'
+MAC_FEED_INTERVAL_SECONDS = int(os.getenv('AGENTHANSA_MAC_FEED_INTERVAL_SECONDS', '300'))
 
 EXTERNAL_POSTING_KEYWORDS = [
     'twitter', 'x.com', 'tweet', 'thread', 'retweet', 'reddit', 'linkedin', 'medium', 'dev.to',
@@ -95,6 +105,12 @@ def log(msg):
 def append_task_summary(event: dict):
     TASK_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     with TASK_SUMMARY.open('a', encoding='utf-8') as f:
+        f.write(json.dumps({'ts': datetime.now().isoformat(timespec='seconds'), **event}, ensure_ascii=False) + '\n')
+
+
+def append_unknown_challenge(event: dict):
+    UNKNOWN_CHALLENGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with UNKNOWN_CHALLENGE_LOG.open('a', encoding='utf-8') as f:
         f.write(json.dumps({'ts': datetime.now().isoformat(timespec='seconds'), **event}, ensure_ascii=False) + '\n')
 
 
@@ -322,8 +338,9 @@ def get_derouter_settings():
         cfg = {}
     return {
         'key': DEROUTER_KEY or cfg.get('derouter_api_key') or '',
-        'draft_model': cfg.get('derouter_gpt_model') or DEROUTER_DRAFT_MODEL,
+        'draft_model': cfg.get('derouter_draft_model') or DEROUTER_DRAFT_MODEL,
         'review_model': cfg.get('derouter_review_model') or DEROUTER_REVIEW_MODEL,
+        'route': cfg.get('high_value_route') or HIGH_VALUE_ROUTE,
     }
 
 
@@ -600,21 +617,125 @@ def do_digest(key):
     return digest is not None and err is None, err
 
 
-def do_forum_comment(key):
+def do_forum_comment(key, state=None):
     feed, err = safe_req('/forum?sort=recent&limit=30', key=key)
     if err or not feed:
         return False, err or 'forum unavailable'
     posts = feed.get('posts') or []
+    today = datetime.now().strftime('%Y-%m-%d')
+    state = state if isinstance(state, dict) else {}
+    comment_state = state.setdefault('comment_guard', {'day': today, 'count': 0, 'post_ids': []})
+    if comment_state.get('day') != today:
+        comment_state.clear()
+        comment_state.update({'day': today, 'count': 0, 'post_ids': []})
+    if int(comment_state.get('count', 0) or 0) >= 2:
+        return False, 'comment diminishing cap reached'
+    seen_posts = set(str(x) for x in (comment_state.get('post_ids') or []))
     for post in posts:
         pid = post.get('id')
         if not pid:
+            continue
+        if str(pid) in seen_posts:
             continue
         title = (post.get('title') or '').strip()
         body = f'Useful angle on "{title}" — concrete examples like this make the forum more helpful for operators and agents.' if title else 'Helpful post — concrete examples make the forum more useful for operators and agents.'
         _, err = safe_req(f'/forum/{pid}/comments', method='POST', data={'body': body}, key=key)
         if not err:
+            comment_state['count'] = int(comment_state.get('count', 0) or 0) + 1
+            comment_state['post_ids'] = (comment_state.get('post_ids') or []) + [str(pid)]
             return True, None
     return False, 'no comment target'
+
+
+def do_forum_vote_once(key, direction='up'):
+    feed, err = safe_req('/forum?sort=recent&limit=25', key=key)
+    if err or not feed:
+        return False, err or 'forum unavailable'
+    for post in (feed.get('posts') or []):
+        pid = post.get('id')
+        if not pid:
+            continue
+        _, verr = safe_req(f"/forum/{pid}/vote?direction={direction}", method='POST', data={}, key=key)
+        if not verr:
+            return True, None
+    return False, 'no vote target'
+
+
+def run_browser_executor(task):
+    stub = browser_executor_stub(task)
+    if not BROWSER_EXECUTOR_CMD:
+        return {**stub, 'ok': False, 'error': 'browser_executor_cmd_missing'}
+    try:
+        proc = subprocess.run(
+            [BROWSER_EXECUTOR_CMD, json.dumps(task, ensure_ascii=False)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode == 0:
+            try:
+                payload = json.loads((proc.stdout or '').strip() or '{}')
+            except Exception:
+                payload = {'ok': True, 'proof_url': (proc.stdout or '').strip()}
+            payload.setdefault('ok', True)
+            payload.setdefault('contract', stub.get('contract'))
+            return payload
+        return {**stub, 'ok': False, 'error': (proc.stderr or proc.stdout or 'executor_failed')[:300]}
+    except Exception as e:
+        return {**stub, 'ok': False, 'error': str(e)}
+
+
+def redpacket_action_type(packet):
+    text = normalize_title(' '.join([
+        packet.get('title') or '',
+        packet.get('challenge_description') or '',
+    ]))
+    if 'upvote' in text or 'vote up' in text:
+        return 'forum_upvote'
+    if 'downvote' in text or 'vote down' in text:
+        return 'forum_downvote'
+    if 'forum post' in text or 'publish a post' in text:
+        return 'forum_post'
+    if 'comment' in text:
+        return 'forum_comment'
+    if 'referral' in text or 'ref link' in text:
+        return 'referral_generate'
+    if 'digest' in text or 'read forum' in text:
+        return 'digest_read'
+    return None
+
+
+def execute_redpacket_action(key, packet, state):
+    action = redpacket_action_type(packet)
+    if not action:
+        append_unknown_challenge({
+            'packet_id': packet.get('id'),
+            'title': packet.get('title'),
+            'challenge_description': packet.get('challenge_description'),
+            'context': {'task_type': packet.get('type'), 'status': packet.get('status')},
+            'classification': 'unknown',
+        })
+        return None, None
+    if action == 'forum_upvote':
+        ok, err = do_forum_vote_once(key, direction='up')
+        return action, None if ok else err
+    if action == 'forum_downvote':
+        ok, err = do_forum_vote_once(key, direction='down')
+        return action, None if ok else err
+    if action == 'forum_post':
+        ok, err = do_forum_comment(key, state)
+        return 'forum_post_stub_comment', None if ok else err
+    if action == 'forum_comment':
+        ok, err = do_forum_comment(key, state)
+        return action, None if ok else err
+    if action == 'referral_generate':
+        ref_url, err = ensure_distribute_done(key, state)
+        return action, None if ref_url else err
+    if action == 'digest_read':
+        ok, err = do_digest(key)
+        return action, None if ok else err
+    return action, None
 
 
 def do_forum_curation(key, daily):
@@ -661,13 +782,17 @@ def do_forum_curation(key, daily):
     return f'up剩{up_need},down剩{down_need}', None
 
 
-def process_red_packets(key):
+def process_red_packets(key, state):
     red, err = safe_req('/red-packets', key=key)
     if err or not red:
         return '红包状态未知', err or 'red packets unavailable'
     active = red.get('active') or []
     if not active:
         return '红包无急单', None
+    packet = active[0]
+    action, action_err = execute_redpacket_action(key, packet, state)
+    if action:
+        append_task_summary({'status': 'redpacket_action', 'action': action, 'error': action_err, 'packet_id': packet.get('id')})
     proc = subprocess.run(['python3', SNIPER_SCRIPT], capture_output=True, text=True, timeout=180, check=False)
     if proc.returncode == 0:
         return f'红包已处理({len(active)})', None
@@ -721,6 +846,34 @@ def handle_competitive_quests(key, feed_quests, all_quests):
             'reward_xp': rewards['xp'],
             'priority_score': quest_score(q),
         }
+        task_meta = classify_task_detail(q) if RUNTIME_PROFILE == 'mac_openclaw' else {'task_class': 'legacy', 'reason': 'non-mac legacy mode'}
+        task_class = task_meta['task_class']
+        if task_class == 'browser_proof_required':
+            browser_result = run_browser_executor(q) if RUNTIME_PROFILE == 'mac_openclaw' else browser_executor_stub(q)
+            append_task_summary({
+                'status': 'browser_executor_routed',
+                'task_class': task_class,
+                'title': title,
+                'task_reason': task_meta.get('reason'),
+                'browser_result': browser_result,
+            })
+            manual.append({
+                **base_item,
+                'reason': 'browser/proof任务已路由browser executor',
+                'task_class': task_class,
+                'task_reason': task_meta.get('reason'),
+                'browser_result': browser_result,
+                'recommendation': 'browser executor',
+            })
+            continue
+        if task_class == 'skip':
+            manual.append({
+                **base_item,
+                'reason': f"任务已skip：{task_meta.get('reason')}",
+                'task_class': task_class,
+                'recommendation': 'skip',
+            })
+            continue
         reason = manual_reason(q)
         if reason:
             manual.append({
@@ -771,9 +924,21 @@ def handle_competitive_quests(key, feed_quests, all_quests):
             'reward': reward_text,
             'reward_usdc': rewards['usdc'],
             'reward_xp': rewards['xp'],
+            'task_class': task_class,
+            'task_reason': task_meta.get('reason'),
         }
         auto_done.append(item)
-        append_task_summary({'status': 'completed', 'count': 1, 'tasks': [item]})
+        append_task_summary({
+            'status': 'completed',
+            'count': 1,
+            'tasks': [item],
+            'task_class': task_class,
+            'draft_model': DEROUTER_DRAFT_MODEL,
+            'review_model': DEROUTER_REVIEW_MODEL,
+            'review_passed': task_class == 'text_high_value',
+            'submitted': True,
+            'proof_required': bool(q.get('proof_requirements') or q.get('proof_type') or q.get('require_proof')),
+        })
         log(f'competitive submit ok: {title}')
 
     manual.sort(key=lambda item: item.get('priority_score', 0), reverse=True)
@@ -827,7 +992,7 @@ def complete_daily_quests(key, state):
             log(f'distribute err: {dist_err}')
 
     if not (by_id.get('create') or {}).get('completed'):
-        ok, create_err = do_forum_comment(key)
+        ok, create_err = do_forum_comment(key, state)
         if ok:
             done.append('create✅')
         elif create_err:
@@ -872,8 +1037,16 @@ def main():
         blockers.append('feed失败')
         feed = {}
     urgent = feed.get('urgent') or []
+    now_epoch = int(time.time())
+    if RUNTIME_PROFILE == 'mac_openclaw' and not urgent:
+        last_feed = int(state.get('last_feed_classify_epoch', 0) or 0)
+        if last_feed and now_epoch - last_feed < MAC_FEED_INTERVAL_SECONDS:
+            append_task_summary({'status': 'idle_skip', 'reason': 'mac feed interval guard', 'seconds_to_next': MAC_FEED_INTERVAL_SECONDS - (now_epoch - last_feed)})
+            print('NO_REPLY')
+            return
+        state['last_feed_classify_epoch'] = now_epoch
 
-    red_result, red_err = process_red_packets(key)
+    red_result, red_err = process_red_packets(key, state)
     if red_err:
         blockers.append('红包处理异常')
 
@@ -942,4 +1115,3 @@ if __name__ == '__main__':
     except Exception as e:
         print(f'巡检失败：{e}')
         sys.exit(1)
-
