@@ -14,11 +14,6 @@ BROWSER_PROOF_KEYWORDS = [
     'twitter', 'x.com', 'reddit', 'linkedin', 'youtube', 'telegram', 'discord', 'external platform',
     'manual verification', 'verify manually', 'browser', 'open website', 'post link'
 ]
-HIGH_VALUE_KEYWORDS = [
-    'technical', 'documentation', 'migration', 'strategy', 'analysis', 'research', 'competitor',
-    'case study', 'whitepaper', 'alliance', 'competitive'
-]
-SIMPLE_TEXT_KEYWORDS = ['faq', 'guide', 'compare', 'comparison', 'list', 'checklist', 'pricing']
 SPAMMY_KEYWORDS = ['great post', 'nice post', 'thanks for sharing', 'quick feedback', 'short answer']
 DAILY_API_KEYWORDS = [
     'daily quest', 'checkin', 'check-in', 'curate', 'referral', 'distribute',
@@ -31,7 +26,7 @@ DAILY_API_BLOCKERS = [
 ]
 ALLIANCE_HIGH_VALUE_KEYWORDS = ['alliance', 'competitive', 'merchant', 'campaign', 'strategy', 'proposal']
 LONG_FORM_KEYWORDS = ['long-form', '1500', '1000', '800+', 'in-depth', 'detailed']
-HIGH_VALUE_TEXT_KEYWORDS = ['article', 'guide', 'seo', 'review', 'thread', 'campaign', 'strategy', 'proposal', 'writeup']
+HIGH_VALUE_KEYWORDS = ['article', 'guide', 'seo', 'review', 'thread', 'campaign', 'strategy', 'proposal', 'writeup']
 QUALITY_KEYWORDS = ['quality', 'creative', 'creativity', 'conversion', 'high quality', 'engaging']
 HUMAN_JUDGING_KEYWORDS = ['human evaluation', 'subjective judging', 'judge', 'review panel', 'manual review']
 SIMPLE_REPLY_KEYWORDS = ['templated reply', 'copy template', 'simple reply', 'one-line']
@@ -116,7 +111,7 @@ def _score_text_value(text, reward_value):
     if _contains_any(text, LONG_FORM_KEYWORDS):
         score += 2
         reasons.append('long-form writing required (+2)')
-    if _contains_any(text, HIGH_VALUE_TEXT_KEYWORDS):
+    if _contains_any(text, HIGH_VALUE_KEYWORDS):
         score += 2
         reasons.append('high-value writing keywords matched (+2)')
     if _contains_any(text, QUALITY_KEYWORDS):
@@ -149,14 +144,15 @@ def classify_task_detail(task_like):
     kind = str((task_like or {}).get('type') or (task_like or {}).get('kind') or '').lower() if isinstance(task_like, dict) else ''
     reward_value = _reward_value(task_like)
 
+    # Hard override: redpacket
+    if _is_redpacket(task_like, text, kind):
+        return {'task_class': 'redpacket', 'reason': 'hard override: deterministic red-packet semantics (challenge/join/next_packet)'}
+
     # Hard override: skip for high-risk/spam-prone/poor-fit tasks
     if _contains_any(text, SKIP_RISKY_KEYWORDS) or _contains_any(text, SPAMMY_KEYWORDS):
         return {'task_class': 'skip', 'reason': 'hard override: spam-risky or poor-fit automation task'}
     if reward_value and reward_value <= LOW_REWARD_SKIP_THRESHOLD and _contains_any(text, ['manual', 'external', 'proof', 'social', 'browser']):
         return {'task_class': 'skip', 'reason': f'hard override: low reward ({reward_value:g}) with high execution risk'}
-
-    if _is_redpacket(task_like, text, kind):
-        return {'task_class': 'redpacket', 'reason': 'deterministic red-packet semantics (challenge/join/next_packet)'}
 
     # Hard override: browser proof required
     if _contains_any(text, BROWSER_PROOF_KEYWORDS):
@@ -169,14 +165,9 @@ def classify_task_detail(task_like):
     reason = '; '.join(reasons) if reasons else 'no strong signals'
     if score >= 5:
         return {'task_class': 'text_high_value', 'reason': f'score={score} (>=5): {reason}'}
-    if 2 <= score <= 4:
+    if score >= 2:
         return {'task_class': 'text_simple', 'reason': f'score={score} (2-4): {reason}'}
-
-    if any(x in text for x in SIMPLE_TEXT_KEYWORDS) or re.search(r'\b(write|draft|answer|explain)\b', text):
-        return {'task_class': 'text_simple', 'reason': f'text task below high-value threshold (score={score}): {reason}'}
-    if text.strip():
-        return {'task_class': 'skip', 'reason': f'low-confidence/poor-fit task (score={score}): {reason}'}
-    return {'task_class': 'skip', 'reason': 'empty task context'}
+    return {'task_class': 'skip', 'reason': f'final fallback: low-confidence/poor-fit task (score={score}): {reason}'}
 
 
 def classify_task(task_like):
